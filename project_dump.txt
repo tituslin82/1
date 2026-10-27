@@ -1,0 +1,6468 @@
+
+
+================================================================================
+FILE: analyzer/global.go
+================================================================================
+package analyzer
+
+import (
+	"dolly-sensor/config"
+	"dolly-sensor/mitigation"
+	"dolly-sensor/packet"
+	"dolly-sensor/stateful"
+	"fmt"
+	"net"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+)
+
+const (
+	CooldownDiscord  = 10 * time.Minute
+	MaxProtocolosTop = 5
+)
+
+type PerfilGlobalIP struct {
+	IP               string    `json:"ip"`
+	CurrentMbps      float64   `json:"current_mbps"`
+	PromedioMbps     float64   `json:"promedio_mbps"`
+	DesvioMbps       float64   `json:"desvio_mbps"`
+	CurrentPPS       float64   `json:"current_pps"`
+	PromedioPPS      float64   `json:"promedio_pps"`
+	DesvioPPS        float64   `json:"desvio_pps"`
+	PuntajeAmenaza   int       `json:"puntaje_amenaza"`
+	Muestras         int       `json:"muestras"`
+	UltimaMuestra    time.Time `json:"ultima_muestra"`
+	ProtocolosTop    []string  `json:"protocolos_top"`
+}
+
+type thresholds struct {
+	SueloPPS       float64
+	ZScoreExtremo  float64
+	Persistencia   int
+	UmbralThreat   float64
+}
+
+type ResultadoEvaluacionInbound struct {
+	CoincideDestinoPropio bool
+	Alerta                bool
+	NombreAlerta          string
+	RazonAlerta           string
+	PPSActual             float64
+	PPSBase               float64
+	PPSThreshold          float64
+	SourcePPS             float64
+}
+
+type InboundProfileProvider interface {
+	GetProfile(ip string) *packet.PersistentProfile
+}
+
+type GlobalSummary struct {
+	TotalCurrentPPS  float64 `json:"total_current_pps"`
+	TotalCurrentMbps float64 `json:"total_current_mbps"`
+	TotalSamples     int     `json:"total_samples"`
+	ActiveTargets    int     `json:"active_targets"`
+}
+
+type analyzerShard struct {
+	mu            sync.Mutex
+	realtimePPS    map[string]*PerfilZScore
+	realtimeMbps   map[string]*PerfilZScore
+	sourcePPS      map[string]*PerfilZScore
+	sourceDestPPS  map[string]*PerfilZScore
+	puntajes       map[string]float64
+	contadores     map[string]int
+}
+
+type PerfilInboundGlobal struct {
+	ownedNets      []*net.IPNet
+	mu             sync.Mutex // Solo para alertCooldowns
+	alertCooldowns map[string]time.Time
+	
+	shards         []*analyzerShard
+	numShards      int
+
+	blocklist      *mitigation.BlocklistEngine
+	bgp            *mitigation.BGPManager
+	cfg            config.Config
+	profiler       InboundProfileProvider
+	HasConn        func(srcIP string, srcPort uint16, dstIP string, dstPort uint16) bool
+	ValidateTCP    func(pkt *packet.Event) stateful.SecurityCheck
+	ValidateTCPFlood func(pkt *packet.Event, syn, ack int) stateful.SecurityCheck
+}
+
+func NuevoPerfilInboundGlobal(ownedNets []*net.IPNet, bl *mitigation.BlocklistEngine, bgp *mitigation.BGPManager, cfg config.Config, prof InboundProfileProvider) *PerfilInboundGlobal {
+	numShards := cfg.Performance.Shards
+	p := &PerfilInboundGlobal{
+		ownedNets:      ownedNets,
+		alertCooldowns: make(map[string]time.Time),
+		blocklist:      bl,
+		bgp:            bgp,
+		cfg:            cfg,
+		profiler:       prof,
+		numShards:      numShards,
+		shards:         make([]*analyzerShard, numShards),
+	}
+	for i := 0; i < numShards; i++ {
+		p.shards[i] = &analyzerShard{
+			realtimePPS:   make(map[string]*PerfilZScore),
+			realtimeMbps:  make(map[string]*PerfilZScore),
+			sourcePPS:     make(map[string]*PerfilZScore),
+			sourceDestPPS: make(map[string]*PerfilZScore),
+			puntajes:      make(map[string]float64),
+			contadores:    make(map[string]int),
+		}
+	}
+	return p
+}
+
+func (p *PerfilInboundGlobal) getShard(ip string) *analyzerShard {
+	h := uint32(2166136261)
+	for i := 0; i < len(ip); i++ {
+		h *= 16777619
+		h ^= uint32(ip[i])
+	}
+	return p.shards[h%uint32(p.numShards)]
+}
+
+func (p *PerfilInboundGlobal) Evaluar(pkt *packet.Event, cfg config.Config) ResultadoEvaluacionInbound {
+	srcIP := pkt.SrcIP
+	dstIP := pkt.DstIP
+	protocolo := pkt.BestProtocol()
+	bytes := pkt.FrameLength
+	
+	sr := pkt.SamplingRate
+	if sr == 0 { sr = 1 }
+
+	if !p.esDestinoPropio(dstIP) {
+		return ResultadoEvaluacionInbound{}
+	}
+
+	// 1. Baseline & Z-Score Analysis (SHARDED por IP de destino)
+	shard := p.getShard(dstIP)
+	
+	thr := getDetectionThresholds(cfg.Detection.NetworkType, cfg.Detection.Sensitivity)
+	ahora := pkt.Timestamp
+	if ahora.IsZero() { ahora = time.Now() }
+
+	shard.mu.Lock()
+	pps, ok := shard.realtimePPS[dstIP]
+	if !ok { pps = NuevoPerfilZScore(); shard.realtimePPS[dstIP] = pps }
+	mbps, ok := shard.realtimeMbps[dstIP]
+	if !ok { mbps = NuevoPerfilZScore(); shard.realtimeMbps[dstIP] = mbps }
+	
+	var sdPPS *PerfilZScore
+	if srcIP != "" {
+		keySD := srcIP + "-" + dstIP
+		sdPPS, ok = shard.sourceDestPPS[keySD]
+		if !ok { sdPPS = NuevoPerfilZScore(); shard.sourceDestPPS[keySD] = sdPPS }
+	}
+	
+	resPPS := pps.ObservarConPeso(ahora, float64(sr))
+	realBytes := float64(bytes) * float64(sr)
+	resMbps := mbps.ObservarConPeso(ahora, (realBytes*8)/1_000_000)
+
+	var resSourceDestPPS ResultadoZScore
+	if sdPPS != nil {
+		resSourceDestPPS = sdPPS.ObservarConPeso(ahora, float64(sr))
+	}
+
+	pkt.CurrentPPS = resPPS.Actual
+	pkt.SourcePPS = resSourceDestPPS.Actual
+	shard.mu.Unlock()
+
+	// 2. Ejecutar el Pipeline de Filtros
+	if alert, name, reason := p.ExecutePipeline(pkt, cfg); alert {
+		return ResultadoEvaluacionInbound{
+			CoincideDestinoPropio: true,
+			Alerta:                true,
+			NombreAlerta:          name,
+			RazonAlerta:           reason,
+			PPSActual:             resPPS.Actual,
+			SourcePPS:             resSourceDestPPS.Actual,
+		}
+	}
+
+	puntos := 0.0
+	if resPPS.Actual > thr.SueloPPS { puntos += (resPPS.Actual - thr.SueloPPS) / 400.0 }
+	if resPPS.Desvio > 5.0 {
+		z := (resPPS.Actual - resPPS.Media) / resPPS.Desvio
+		if z > thr.ZScoreExtremo { puntos += 40.0 }
+	}
+	tamanioPromedio := realBytes / float64(sr)
+	proto := strings.ToUpper(protocolo)
+	if resPPS.Actual > thr.SueloPPS && (proto == "SYN" || proto == "UDP") && tamanioPromedio < 128 { puntos += 30.0 }
+
+	shard.mu.Lock()
+	shard.puntajes[dstIP] = (0.2 * puntos) + (0.8 * shard.puntajes[dstIP])
+	if shard.puntajes[dstIP] >= thr.UmbralThreat { shard.contadores[dstIP]++ } else { if shard.contadores[dstIP] > 0 { shard.contadores[dstIP]-- } }
+
+	resultado := ResultadoEvaluacionInbound{
+		CoincideDestinoPropio: true,
+		PPSActual:             resPPS.Actual,
+		PPSBase:               resPPS.Media,
+		PPSThreshold:          resPPS.Media + (thr.ZScoreExtremo * resPPS.Desvio),
+		SourcePPS:             resSourceDestPPS.Actual,
+	}
+
+	if shard.contadores[dstIP] >= thr.Persistencia {
+		p.mu.Lock()
+		lastAlert, onCooldown := p.alertCooldowns[dstIP]
+		if !onCooldown || ahora.Sub(lastAlert) > CooldownDiscord {
+			p.alertCooldowns[dstIP] = ahora
+			p.mu.Unlock()
+			resultado.Alerta = true
+			resultado.NombreAlerta = "🔥 DDOS-ATTACK-CONFIRMED"
+			resultado.RazonAlerta = fmt.Sprintf("ATAQUE DETECTADO (%s/%s): PPS=%.0f Mbps=%.1f Proto=%s", cfg.Detection.NetworkType, cfg.Detection.Sensitivity, resPPS.Actual, resMbps.Actual, proto)
+			shard.contadores[dstIP] = 0
+		} else { p.mu.Unlock() }
+	}
+	shard.mu.Unlock()
+
+	return resultado
+}
+
+func getDetectionThresholds(netType, sensitivity string) thresholds {
+	t := thresholds{ SueloPPS: 8000.0, ZScoreExtremo: 12.0, Persistencia: 15, UmbralThreat: 100.0 }
+	switch strings.ToLower(netType) {
+	case "home": t.SueloPPS = 5000.0
+	case "office": t.SueloPPS = 25000.0
+	case "datacenter": t.SueloPPS = 100000.0
+	}
+	switch strings.ToLower(sensitivity) {
+	case "relaxed": t.ZScoreExtremo = 25.0; t.Persistencia = 15; t.UmbralThreat = 150.0
+	case "balanced": t.ZScoreExtremo = 12.0; t.Persistencia = 8; t.UmbralThreat = 100.0
+	case "aggressive": t.ZScoreExtremo = 6.0; t.Persistencia = 5; t.UmbralThreat = 60.0
+	case "ultra": t.ZScoreExtremo = 4.0; t.Persistencia = 3; t.UmbralThreat = 40.0
+	case "instant": t.ZScoreExtremo = 2.5; t.Persistencia = 1; t.UmbralThreat = 20.0
+	}
+	return t
+}
+
+func (p *PerfilInboundGlobal) GetGlobalSummary() GlobalSummary {
+	var summary GlobalSummary
+	for i := 0; i < p.numShards; i++ {
+		shard := p.shards[i]
+		shard.mu.Lock()
+		summary.ActiveTargets += len(shard.realtimePPS)
+		for ip, pps := range shard.realtimePPS {
+			resPPS := pps.Resumen()
+			resMbps := shard.realtimeMbps[ip].Resumen()
+			summary.TotalCurrentPPS += resPPS.Actual
+			summary.TotalCurrentMbps += resMbps.Actual
+			summary.TotalSamples += resPPS.Muestras
+		}
+		shard.mu.Unlock()
+	}
+	return summary
+}
+
+func (p *PerfilInboundGlobal) SnapshotPerfiles() []PerfilGlobalIP {
+	var allIPs []string
+	for i := 0; i < p.numShards; i++ {
+		shard := p.shards[i]
+		shard.mu.Lock()
+		for ip := range shard.realtimePPS {
+			allIPs = append(allIPs, ip)
+		}
+		shard.mu.Unlock()
+	}
+	sort.Strings(allIPs)
+
+	resultados := make([]PerfilGlobalIP, 0, len(allIPs))
+	for _, ip := range allIPs {
+		shard := p.getShard(ip)
+		shard.mu.Lock()
+		resPPS := shard.realtimePPS[ip].Resumen()
+		resMbps := shard.realtimeMbps[ip].Resumen()
+		puntaje := int(shard.puntajes[ip])
+		shard.mu.Unlock()
+
+		var topProtos []string
+		if p.profiler != nil {
+			if pers := p.profiler.GetProfile(ip); pers != nil {
+				pers.RLock()
+				topProtos = p.getTopProtosInternal(pers.PuertosFrecuentes)
+				pers.RUnlock()
+			}
+		}
+		resultados = append(resultados, PerfilGlobalIP{
+			IP: ip, CurrentMbps: resMbps.Actual, PromedioMbps: resMbps.Media, DesvioMbps: resMbps.Desvio,
+			CurrentPPS: resPPS.Actual, PromedioPPS: resPPS.Media, DesvioPPS: resPPS.Desvio,
+			PuntajeAmenaza: puntaje, Muestras: resPPS.Muestras, UltimaMuestra: time.Now(), ProtocolosTop: topProtos,
+		})
+	}
+	return resultados
+}
+
+func (p *PerfilInboundGlobal) getTopProtosInternal(puertos map[uint16]uint64) []string {
+	if len(puertos) == 0 { return nil }
+	type item struct { p uint16; c uint64 }
+	items := make([]item, 0, len(puertos))
+	for port, count := range puertos { items = append(items, item{p: port, c: count}) }
+	sort.Slice(items, func(i, j int) bool { return items[i].c > items[j].c })
+	if len(items) > MaxProtocolosTop { items = items[:MaxProtocolosTop] }
+	res := make([]string, 0, len(items))
+	for _, it := range items { res = append(res, fmt.Sprintf("%d", it.p)) }
+	return res
+}
+
+func (p *PerfilInboundGlobal) esDestinoPropio(dstIP string) bool {
+	ip := net.ParseIP(dstIP)
+	if ip == nil { return false }
+	for _, network := range p.ownedNets {
+		if network.Contains(ip) { return true }
+	}
+	return false
+}
+
+
+================================================================================
+FILE: analyzer/integration_test.go
+================================================================================
+package analyzer
+
+import (
+	"dolly-sensor/config"
+	"dolly-sensor/mitigation"
+	"dolly-sensor/packet"
+	"net"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+func TestFullMitigationPipeline(t *testing.T) {
+	// 1. Configuración del Entorno
+	cfg := config.Default()
+	cfg.BGP.Enabled = true
+	ownedNets := []*net.IPNet{{IP: net.ParseIP("10.0.0.0"), Mask: net.CIDRMask(24, 32)}}
+	
+	// Mock de BGP para capturar comandos
+	var mu sync.Mutex
+	capturedCommands := []string{}
+	bgp := mitigation.NewBGPManager(cfg.BGP)
+	bgp.Executor = func(args []string) error {
+		mu.Lock()
+		capturedCommands = append(capturedCommands, strings.Join(args, " "))
+		mu.Unlock()
+		return nil
+	}
+
+	blocklist := mitigation.NewBlocklistEngine()
+	analyzer := NuevoPerfilInboundGlobal(ownedNets, blocklist, bgp, cfg, nil)
+
+	// 2. Simular Ataque FTP (Flood desde IP atacante)
+	attackerIP := "192.168.1.100"
+	victimIP := "10.0.0.5"
+	
+	// Necesitamos que el Z-Score llegue a > 1000. 
+	// Si enviamos 1500 unidades por segundo (SamplingRate=1500)
+	ahora := time.Now()
+	for i := 0; i < 10; i++ {
+		pkt := &packet.Event{
+			SrcIP: attackerIP,
+			DstIP: victimIP,
+			SrcPort: 22222, 
+			DstPort: 21,
+			Transport: "TCP",
+			FrameLength: 64,
+			SamplingRate: 1500, 
+			Timestamp: ahora.Add(time.Duration(i) * 1100 * time.Millisecond),
+		}
+		
+		res := analyzer.Evaluar(pkt, cfg)
+		if res.Alerta {
+			t.Logf("Alerta disparada en iteración %d: %s", i, res.NombreAlerta)
+		}
+	}
+
+	// Dar tiempo a la goroutine de BGP
+	time.Sleep(100 * time.Millisecond)
+
+	// 3. Verificación
+	mu.Lock()
+	defer mu.Unlock()
+	
+	foundFlowspec := false
+	for _, cmd := range capturedCommands {
+		if strings.Contains(cmd, "ipv4-flowspec") && strings.Contains(cmd, "rate-limit 250") {
+			foundFlowspec = true
+			break
+		}
+	}
+
+	if !foundFlowspec {
+		t.Errorf("El pipeline no generó el comando Flowspec esperado. Comandos capturados: %v", capturedCommands)
+	}
+}
+
+
+================================================================================
+FILE: analyzer/pipeline.go
+================================================================================
+package analyzer
+
+import (
+	"dolly-sensor/basefilters"
+	"dolly-sensor/config"
+	"dolly-sensor/packet"
+	"fmt"
+	"log"
+	"time"
+)
+
+// ExecutePipeline orquesta la cadena de filtros en el orden solicitado
+func (p *PerfilInboundGlobal) ExecutePipeline(pkt *packet.Event, cfg config.Config) (alert bool, name, reason string) {
+	srcIP := pkt.SrcIP
+	dstIP := pkt.DstIP
+
+	// 0. Obtener Trust Score para uso en filtros
+	if p.profiler != nil && srcIP != "" {
+		if pers := p.profiler.GetProfile(dstIP); pers != nil {
+			pers.RLock()
+			if trust, ok := pers.ReputacionOrigenes[srcIP]; ok {
+				pkt.SourceTrustScore = trust.TrustScore
+			}
+			pers.RUnlock()
+		}
+	}
+
+	// 1. Blocklist Global (Bloqueo explícito rápido)
+	if p.blocklist != nil && srcIP != "" {
+		if p.blocklist.IsBlocked(srcIP) {
+			return true, "🚫 BLOCKLIST-HIT", fmt.Sprintf("Source IP %s matches global blocklist", srcIP)
+		}
+	}
+
+	// 2. TRUSTSCORE / REPUTACIÓN (Detección por comportamiento histórico, e.g. SYN Flood)
+	// Se ejecuta ANTES que stateful para proteger el motor de estado de flooders conocidos
+	if p.ValidateTCPFlood != nil && srcIP != "" && p.profiler != nil {
+		if pers := p.profiler.GetProfile(dstIP); pers != nil {
+			pers.RLock()
+			trust, hasTrust := pers.ReputacionOrigenes[srcIP]
+			var alertFound bool
+			var m packet.Mitigation
+			
+			if hasTrust {
+				res := p.ValidateTCPFlood(pkt, trust.SYNCount, trust.ACKCount)
+				if res.Alert {
+					alertFound = true
+					m = packet.Mitigation{
+						Alert:    true,
+						Block:    true,
+						Drop:     true,
+						SourceIP: srcIP,
+						Name:     res.Name,
+						Reason:   res.Reason,
+					}
+				}
+			}
+			pers.RUnlock()
+
+			if alertFound {
+				p.ExecuteMitigation(m)
+				return true, m.Name, m.Reason
+			}
+		}
+	}
+
+	// 3. STATEFUL TCP VALIDATION (Protocol correctness, e.g. Out-of-state)
+	if p.ValidateTCP != nil {
+		check := p.ValidateTCP(pkt)
+		if check.Alert {
+			// Evitar que el sensor se bloquee a sí mismo si detecta paquetes out-of-state saliendo de nuestra red
+			if check.Name == "🛡️ INVALID-TCP-STATE" && p.esDestinoPropio(pkt.SrcIP) {
+				return false, "", ""
+			}
+
+			m := packet.Mitigation{
+				Alert:    true,
+				Block:    true,
+				SourceIP: srcIP,
+				Name:     check.Name,
+				Reason:   check.Reason,
+			}
+			p.ExecuteMitigation(m)
+			return true, check.Name, check.Reason
+		}
+	}
+
+	// 4. PROTOCOL BASE FILTERS (Aplicación: FTP, SSH, etc.)
+	if m := basefilters.Evaluate(pkt, cfg); m.Alert {
+		if m.Block {
+			p.ExecuteMitigation(m)
+		}
+		return true, m.Name, m.Reason
+	}
+
+	return false, "", ""
+}
+
+// ExecuteMitigation es el encargado de disparar la acción técnica real (BGP Flowspec)
+func (p *PerfilInboundGlobal) ExecuteMitigation(m packet.Mitigation) {
+	if !m.Block || m.SourceIP == "" {
+		return
+	}
+
+	triggerID := m.Name + "-" + m.SourceIP
+	// Evitar duplicidad de mitigaciones en corto tiempo
+	if !p.blocklist.MarkTriggered(triggerID) {
+		return
+	}
+
+	log.Printf("[PIPELINE] Mitigating: %s for Source %s. Reason: %s", m.Name, m.SourceIP, m.Reason)
+
+	if p.bgp != nil {
+		go func() {
+			// Ahora enviamos la receta completa 'm' para un bloqueo granular
+			err := p.bgp.AnnounceFlowspec(m)
+			if err != nil {
+				log.Printf("[BGP] Error in flowspec announcement: %v", err)
+			}
+			
+			// Si tiene duración, después de que pase, limpiamos el triggered para que pueda re-activarse si el ataque sigue
+			if m.Duration > 0 {
+				time.Sleep(time.Duration(m.Duration) * time.Second)
+				p.blocklist.ClearTriggered(triggerID)
+			}
+		}()
+	}
+}
+
+
+================================================================================
+FILE: analyzer/zscore.go
+================================================================================
+package analyzer
+
+import (
+	"math"
+	"sync"
+	"time"
+)
+
+type ResultadoZScore struct {
+	Actual   float64
+	Media    float64
+	Desvio   float64
+	Muestras int
+}
+
+type PerfilZScore struct {
+	mu               sync.Mutex
+	inicioVentana    time.Time
+	acumuladoVentana float64
+	media            float64
+	m2               float64
+	cantidad         int
+	ultimaMuestra    time.Time
+}
+
+const alphaAdaptacion = 0.1
+
+func NuevoPerfilZScore() *PerfilZScore {
+	return &PerfilZScore{}
+}
+
+func (p *PerfilZScore) ObservarConPeso(ahora time.Time, peso float64) ResultadoZScore {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.inicioVentana.IsZero() {
+		p.inicioVentana = ahora
+	}
+	p.acumuladoVentana += peso
+
+	transcurrido := ahora.Sub(p.inicioVentana).Seconds()
+	if transcurrido >= 1.0 {
+		tasa := p.acumuladoVentana / transcurrido
+		p.actualizarEstadisticas(tasa, ahora)
+		p.inicioVentana = ahora
+		p.acumuladoVentana = 0
+		return p.resultadoInterno(tasa)
+	}
+
+	return p.resultadoInterno(0)
+}
+
+func (p *PerfilZScore) Resumen() ResultadoZScore {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	tasa := 0.0
+	if !p.inicioVentana.IsZero() {
+		if dur := time.Since(p.inicioVentana).Seconds(); dur > 0 {
+			tasa = p.acumuladoVentana / dur
+		}
+	}
+	return p.resultadoInterno(tasa)
+}
+
+func (p *PerfilZScore) resultadoInterno(actual float64) ResultadoZScore {
+	varianza := 0.0
+	if p.cantidad > 1 {
+		varianza = p.m2 / float64(p.cantidad-1)
+	}
+	desvio := math.Sqrt(varianza)
+	return ResultadoZScore{
+		Actual: actual, Media: p.media, Desvio: desvio, Muestras: p.cantidad,
+	}
+}
+
+func (p *PerfilZScore) actualizarEstadisticas(valor float64, momento time.Time) {
+	p.cantidad++
+	if p.cantidad == 1 {
+		p.media = valor
+		p.m2 = 0
+	} else {
+		// Usamos un factor de olvido para que el baseline no sea infinito
+		// pero mantenemos el cálculo de varianza
+		diff := valor - p.media
+		p.media += alphaAdaptacion * diff
+		p.m2 = (1-alphaAdaptacion)*p.m2 + alphaAdaptacion*diff*(valor-p.media)
+	}
+	p.ultimaMuestra = momento
+}
+
+
+================================================================================
+FILE: analyzer/zscore_test.go
+================================================================================
+package analyzer
+
+import (
+	"testing"
+	"time"
+)
+
+func TestZScoreMath(t *testing.T) {
+	p := NuevoPerfilZScore()
+	ahora := time.Now()
+
+	// Simular muestras cada 2 segundos para asegurar que la ventana se limpie
+	for i := 1; i <= 5; i++ {
+		_ = p.ObservarConPeso(ahora.Add(time.Duration(i*2)*time.Second), 2000)
+	}
+	
+	res := p.Resumen()
+	if res.Media < 500 {
+		t.Errorf("La media debería estar convergiendo, actual: %f", res.Media)
+	}
+
+	// Un pico claro: enviamos 100000 unidades en 2 segundos = 50000 PPS
+	pico := p.ObservarConPeso(ahora.Add(12*time.Second), 100000)
+	
+	if pico.Actual < 45000 {
+		t.Errorf("El valor actual debería estar cerca de 50000, obtenido: %f", pico.Actual)
+	}
+	
+	if pico.Desvio == 0 {
+		t.Error("El desvío estándar debería ser mayor a 0 tras un pico")
+	}
+}
+
+
+================================================================================
+FILE: app/run.go
+================================================================================
+package app
+import (
+	"context"
+	"dolly-sensor/analyzer"
+	"dolly-sensor/config"
+	"dolly-sensor/dashboard"
+	"dolly-sensor/mitigation"
+	"dolly-sensor/packet"
+	"dolly-sensor/profiler"
+	"dolly-sensor/sflow"
+	"dolly-sensor/store"
+	"fmt"
+	"log"
+	"net"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+)
+
+func Run() error {
+	cfg, err := config.Load("config.json")
+	if err != nil {
+		log.Printf("[CORE] error loading config.json, using defaults: %v", err)
+		cfg = config.Default()
+	}
+
+	if err := cfg.Validate(); err != nil {
+		return fmt.Errorf("config validation failed: %v", err)
+	}
+
+	ownedNets := parseOwnedNets(cfg.Local.OwnedCIDRs)
+	packetStore := store.New(
+		cfg.Store.MaxRecentPackets,
+		ownedNets,
+		cfg.Performance.Shards,
+		time.Duration(cfg.Performance.StatsTTL)*time.Second,
+		time.Duration(cfg.Performance.CleanupInterval)*time.Second,
+	)
+
+	// Cargar mapeos de protocolos
+	if err := packet.LoadProtocols("protocols.json"); err != nil {
+		log.Printf("[CORE] warning: could not load protocols.json: %v", err)
+	}
+
+	// Inicializar Mitigación
+	blocklist := mitigation.NewBlocklistEngine()
+	if err := blocklist.LoadFromPath(cfg.Mitigation.BlocklistPath); err != nil {
+		log.Printf("[CORE] warning: could not load blocklist: %v", err)
+	}
+	bgp := mitigation.NewBGPManager(cfg.BGP)
+
+	// Iniciar el profiler para snapshots y persistencia
+	prof := profiler.NewProfiler(packetStore, cfg, time.Duration(cfg.Performance.ProfilerInterval)*time.Second)
+	prof.Start()
+
+	perfilInbound := analyzer.NuevoPerfilInboundGlobal(ownedNets, blocklist, bgp, cfg, prof)
+	perfilInbound.HasConn = packetStore.HasActiveConnection
+	perfilInbound.ValidateTCP = packetStore.ValidateTCP
+	perfilInbound.ValidateTCPFlood = packetStore.ValidateTCPFlood
+	processor := sflow.NewProcessor(packetStore, perfilInbound, ownedNets, cfg.SFlow.Sampling, cfg)
+
+	if cfg.Alert.DiscordWebhookURL != "" {
+		go startAlertSubscriber(packetStore, cfg.Alert.DiscordWebhookURL)
+	}
+
+	dashConfig := dashboard.RuntimeConfig{
+		CollectorAddr:   cfg.CollectorAddr(),
+		FrontendAddr:    cfg.HTTP.Listen,
+		ObtenerPerfiles: perfilInbound.SnapshotPerfiles,
+		ObtenerResumen:  perfilInbound.GetGlobalSummary,
+		ObtenerDetalleIP: prof.GetProfile,
+		SetManualTrust:  prof.SetManualTrust,
+		GetAllReputations: prof.GetAllReputations,
+		MitigationStatus: func() map[string]interface{} {
+			return map[string]interface{}{
+				"bgp_enabled":       cfg.BGP.Enabled,
+				"blocklist_entries": blocklist.Count(),
+				"announcements":     bgp.GetAnnouncements(),
+			}
+		},
+		ReloadBlocklists: func() error {
+			return blocklist.LoadFromPath(cfg.Mitigation.BlocklistPath)
+		},
+		GetBlocklistFiles: func() []string {
+			return blocklist.GetFiles()
+		},
+		AddBlocklistEntry: func(entry string) error {
+			return blocklist.AddManualBlock(entry)
+		},
+	}
+
+	// Servidor Web / Dashboard
+	go func() {
+		log.Printf("[HTTP] dashboard listening on %s", cfg.HTTP.Listen)
+		if err := dashboard.Run(cfg.HTTP.Listen, "web", packetStore, dashConfig); err != nil {
+			log.Printf("[HTTP] error: %v", err)
+		}
+	}()
+
+	log.Printf("[CORE] starting dolly-sensor (sampling=1:%d, max_packets=%d)",
+		cfg.SFlow.Sampling, cfg.Store.MaxRecentPackets)
+
+	// Capturar señales de terminación para cierre ordenado
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		if err := sflow.Listen(cfg.CollectorAddr(), processor); err != nil {
+			log.Printf("[SFLOW] collector error: %v", err)
+			stop()
+		}
+	}()
+
+	<-ctx.Done()
+	log.Printf("[CORE] shutting down...")
+	return nil
+}
+
+func parseOwnedNets(cidrs []string) []*net.IPNet {
+	nets := make([]*net.IPNet, 0)
+	for _, cidr := range cidrs {
+		_, network, err := net.ParseCIDR(cidr)
+		if err != nil {
+			log.Printf("[CORE] warning: invalid CIDR %s: %v", cidr, err)
+			continue
+		}
+		nets = append(nets, network)
+	}
+	return nets
+}
+
+func startAlertSubscriber(packetStore *store.Store, webhookURL string) {
+	ch := packetStore.Subscribe()
+	defer packetStore.Unsubscribe(ch)
+
+	log.Printf("[ALERTS] subscriber started (webhook enabled)")
+	for pkt := range ch {
+		if pkt.Alert {
+			log.Printf("[ALERT] %s on %s: %s", pkt.AlertName, pkt.DstIP, pkt.AlertReason)
+			// Aquí se implementaría el envío real al webhook de Discord
+		}
+	}
+}
+
+
+================================================================================
+FILE: basefilters/base.go
+================================================================================
+package basefilters
+
+import (
+	"dolly-sensor/config"
+	"dolly-sensor/packet"
+)
+
+type BaseFilter interface {
+	Name() string
+	Protocol() string 
+	Process(pkt *packet.Event, cfg config.Config) packet.Mitigation
+}
+
+var registry = []BaseFilter{}
+
+func Register(f BaseFilter) {
+	registry = append(registry, f)
+}
+
+func GetAll() []BaseFilter {
+	return registry
+}
+
+func Evaluate(pkt *packet.Event, cfg config.Config) packet.Mitigation {
+	for _, f := range registry {
+		if pkt.Protocol == f.Protocol() || f.Protocol() == "*" {
+			if m := f.Process(pkt, cfg); m.Alert {
+				return m
+			}
+		}
+	}
+	return packet.Mitigation{}
+}
+
+
+================================================================================
+FILE: basefilters/ftp.go
+================================================================================
+package basefilters
+
+import (
+	"dolly-sensor/config"
+	"dolly-sensor/packet"
+	"fmt"
+)
+
+// FTPFilter maneja específicamente el canal de CONTROL (Puerto 21)
+type FTPFilter struct{}
+
+func init() {
+	Register(&FTPFilter{})
+}
+
+func (f *FTPFilter) Name() string { return "FTP-CONTROL-BASE" }
+func (f *FTPFilter) Protocol() string { return "*" }
+
+func (f *FTPFilter) Process(pkt *packet.Event, cfg config.Config) packet.Mitigation {
+	// Solo puerto 21
+	if pkt.DstPort != 21 && pkt.SrcPort != 21 {
+		return packet.Mitigation{}
+	}
+
+	// 0. Excepción por Trust Score
+	if pkt.SourceTrustScore >= cfg.Trust.MinScoreForExemption {
+		return packet.Mitigation{}
+	}
+
+	// 1. Mismatch de Protocolo
+	if pkt.Transport != "TCP" {
+		return packet.Mitigation{
+			Alert:    true,
+			Block:    true,
+			Drop:     true,
+			SourceIP: pkt.SrcIP,
+			DestIP:   pkt.DstIP,
+			Protocol: pkt.Transport,
+			DestPort: 21,
+			Duration: cfg.Protocols.FTP.BlockDuration,
+			Name:     "🛡️ FTP-CTRL-NON-TCP",
+			Reason:   fmt.Sprintf("Non-TCP traffic (%s) to FTP control port from %s", pkt.Transport, pkt.SrcIP),
+		}
+	}
+
+	// 2. Puertos Privilegiados
+	if pkt.SrcPort < 1024 {
+		return packet.Mitigation{
+			Alert:    true,
+			Block:    true,
+			Drop:     true,
+			SourceIP: pkt.SrcIP,
+			DestIP:   pkt.DstIP,
+			Duration: cfg.Protocols.FTP.BlockDuration,
+			Name:     "🛡️ FTP-CTRL-PRIVILEGED-PORT",
+			Reason:   fmt.Sprintf("Source IP %s using privileged port %d for FTP Control", pkt.SrcIP, pkt.SrcPort),
+		}
+	}
+
+	// 3. Ratelimit
+	if pkt.SourcePPS > cfg.Protocols.FTP.MaxPPS {
+		return packet.Mitigation{
+			Alert:     true,
+			Block:     true,
+			SourceIP:  pkt.SrcIP,
+			DestIP:    pkt.DstIP,
+			Protocol:  "TCP",
+			DestPort:  21,
+			RateLimit: cfg.Protocols.FTP.RateLimitPPS,
+			Duration:  cfg.Protocols.FTP.BlockDuration,
+			Name:      "🛡️ FTP-CTRL-RATELIMIT",
+			Reason:    fmt.Sprintf("FTP Control Flood: %.0f pps from %s", pkt.SourcePPS, pkt.SrcIP),
+		}
+	}
+
+	// 4. Comandos Malformados (Solo en puerto 21)
+	if pkt.PayloadHex != "" && pkt.InEstablishedSession {
+		if len(pkt.PayloadHex) > 1024 { 
+			return packet.Mitigation{
+				Alert:         true,
+				Block:         true,
+				SourceIP:      pkt.SrcIP,
+				DestPort:      21,
+				PacketLenMin:  512,
+				Name:          "🛡️ FTP-CTRL-MALFORMED",
+				Reason:        "FTP command exceeds maximum length",
+			}
+		}
+	}
+	
+	return packet.Mitigation{}
+}
+
+
+================================================================================
+FILE: basefilters/ftp_data.go
+================================================================================
+package basefilters
+
+import (
+	"dolly-sensor/config"
+	"dolly-sensor/packet"
+	"fmt"
+)
+
+// FTPDataFilter maneja específicamente el canal de DATOS (Puerto 20)
+type FTPDataFilter struct{}
+
+func init() {
+	Register(&FTPDataFilter{})
+}
+
+func (f *FTPDataFilter) Name() string { return "FTP-DATA-BASE" }
+func (f *FTPDataFilter) Protocol() string { return "*" }
+
+func (f *FTPDataFilter) Process(pkt *packet.Event, cfg config.Config) packet.Mitigation {
+	// Solo puerto 20
+	if pkt.DstPort != 20 && pkt.SrcPort != 20 {
+		return packet.Mitigation{}
+	}
+
+	// 0. Excepción por Trust Score
+	if pkt.SourceTrustScore >= cfg.Trust.MinScoreForExemption {
+		return packet.Mitigation{}
+	}
+
+	// 1. Mismatch de Protocolo
+	if pkt.Transport != "TCP" {
+		return packet.Mitigation{
+			Alert:    true,
+			Block:    true,
+			Drop:     true,
+			SourceIP: pkt.SrcIP,
+			DestIP:   pkt.DstIP,
+			Protocol: pkt.Transport,
+			DestPort: 20,
+			Duration: cfg.Protocols.FTPData.BlockDuration,
+			Name:     "🛡️ FTP-DATA-NON-TCP",
+			Reason:   fmt.Sprintf("Non-TCP traffic (%s) to FTP data port from %s", pkt.Transport, pkt.SrcIP),
+		}
+	}
+
+	// 2. Puertos Privilegiados
+	if pkt.SrcPort < 1024 {
+		return packet.Mitigation{
+			Alert:    true,
+			Block:    true,
+			Drop:     true,
+			SourceIP: pkt.SrcIP,
+			DestIP:   pkt.DstIP,
+			Duration: cfg.Protocols.FTPData.BlockDuration,
+			Name:     "🛡️ FTP-DATA-PRIVILEGED-PORT",
+			Reason:   fmt.Sprintf("Source IP %s using privileged port %d for FTP Data", pkt.SrcIP, pkt.SrcPort),
+		}
+	}
+
+	// 3. Ratelimit (Usando umbrales de FTP-Data, que suelen ser más altos)
+	if pkt.SourcePPS > cfg.Protocols.FTPData.MaxPPS {
+		return packet.Mitigation{
+			Alert:     true,
+			Block:     true,
+			SourceIP:  pkt.SrcIP,
+			DestIP:    pkt.DstIP,
+			Protocol:  "TCP",
+			DestPort:  20,
+			RateLimit: cfg.Protocols.FTPData.RateLimitPPS,
+			Duration:  cfg.Protocols.FTPData.BlockDuration,
+			Name:      "🛡️ FTP-DATA-RATELIMIT",
+			Reason:    fmt.Sprintf("FTP Data Flood: %.0f pps from %s (Limit: %.0f)", pkt.SourcePPS, pkt.SrcIP, cfg.Protocols.FTPData.MaxPPS),
+		}
+	}
+
+	return packet.Mitigation{}
+}
+
+
+================================================================================
+FILE: blocklists/.gitkeep
+================================================================================
+
+
+================================================================================
+FILE: blocklists/test.list
+================================================================================
+8.8.8.8
+
+
+================================================================================
+FILE: config/config.go
+================================================================================
+package config
+
+import (
+	"encoding/json"
+	"fmt"
+	"net"
+	"os"
+)
+
+const DefaultPath = "config.json"
+
+type Config struct {
+	SFlow      SFlowConfig      `json:"sflow"`
+	HTTP       HTTPConfig       `json:"http"`
+	Store      StoreConfig      `json:"store"`
+	Local      LocalConfig      `json:"local"`
+	Alert      AlertConfig      `json:"alert"`
+	Detection  DetectionConfig  `json:"detection"`
+	BGP        BGPConfig        `json:"bgp"`
+	Mitigation MitigationConfig `json:"mitigation"`
+	Protocols  ProtocolConfig   `json:"protocols_tuning"`
+	Trust      TrustConfig      `json:"trust_tuning"`
+	Performance PerformanceConfig `json:"performance"`
+}
+
+type PerformanceConfig struct {
+	Shards            int `json:"shards"`              // Número de particiones (64 por defecto)
+	CleanupInterval   int `json:"cleanup_interval"`    // Segundos entre limpiezas de memoria
+	StatsTTL          int `json:"stats_ttl"`           // Cuánto tiempo recordar una IP inactiva (segundos)
+	ProfilerInterval  int `json:"profiler_interval"`   // Segundos entre snapshots del profiler
+}
+
+type ProtocolConfig struct {
+	FTP struct {
+		MaxPPS        float64 `json:"max_pps"`
+		RateLimitPPS  uint32  `json:"ratelimit_pps"`
+		BlockDuration int     `json:"block_duration"`
+	} `json:"ftp"`
+	FTPData struct {
+		MaxPPS        float64 `json:"max_pps"`
+		RateLimitPPS  uint32  `json:"ratelimit_pps"`
+		BlockDuration int     `json:"block_duration"`
+	} `json:"ftp_data"`
+}
+
+type TrustConfig struct {
+	MinScoreForExemption int `json:"min_score_for_exemption"`
+}
+
+type BGPConfig struct {
+	Enabled   bool   `json:"enabled"`
+	LocalAS   uint32 `json:"local_as"`
+	PeerIP    string `json:"peer_ip"`
+	PeerAS    uint32 `json:"peer_as"`
+	Community string `json:"community"` // ej: "65000:666" (RTBH)
+	NextHop   string `json:"next_hop"`
+}
+
+type MitigationConfig struct {
+	BlocklistPath string `json:"blocklist_path"`
+	AutoBlock     bool   `json:"auto_block"`
+}
+
+type SFlowConfig struct {
+	Sampling  int             `json:"sampling"`
+	Polling   int             `json:"polling"`
+	Collector CollectorConfig `json:"collector"`
+}
+
+type CollectorConfig struct {
+	IP      string `json:"ip"`
+	UDPPort int    `json:"udpport"`
+}
+
+type HTTPConfig struct {
+	Listen string `json:"listen"`
+}
+
+type StoreConfig struct {
+	MaxRecentPackets int `json:"max_recent_packets"`
+}
+
+type LocalConfig struct {
+	OwnedCIDRs []string `json:"owned_cidrs"`
+	TrustedIPs []string `json:"trusted_ips"`
+}
+
+type AlertConfig struct {
+	DiscordWebhookURL string `json:"discord_webhook_url"`
+}
+
+type DetectionConfig struct {
+	Sensitivity string `json:"sensitivity"` // relaxed, balanced, aggressive, ultra, instant
+	NetworkType string `json:"network_type"` // home, office, datacenter
+}
+
+func Default() Config {
+	return Config{
+		SFlow: SFlowConfig{Sampling: 1, Polling: 30, Collector: CollectorConfig{IP: "127.0.0.1", UDPPort: 6343}},
+		HTTP:  HTTPConfig{Listen: "127.0.0.1:8080"},
+		Store: StoreConfig{MaxRecentPackets: 100000},
+		Local: LocalConfig{OwnedCIDRs: []string{"127.0.0.0/8", "192.168.1.0/24"}},
+		Alert: AlertConfig{DiscordWebhookURL: ""},
+		Detection: DetectionConfig{
+			Sensitivity: "balanced",
+			NetworkType: "home",
+		},
+		BGP: BGPConfig{
+			Enabled:   false,
+			LocalAS:   65000,
+			Community: "65000:666",
+		},
+		Mitigation: MitigationConfig{
+			BlocklistPath: "blocklists/",
+			AutoBlock:     true,
+		},
+		Protocols: ProtocolConfig{
+			FTP: struct {
+				MaxPPS        float64 `json:"max_pps"`
+				RateLimitPPS  uint32  `json:"ratelimit_pps"`
+				BlockDuration int     `json:"block_duration"`
+			}{MaxPPS: 1000, RateLimitPPS: 250, BlockDuration: 60},
+			FTPData: struct {
+				MaxPPS        float64 `json:"max_pps"`
+				RateLimitPPS  uint32  `json:"ratelimit_pps"`
+				BlockDuration int     `json:"block_duration"`
+			}{MaxPPS: 5000, RateLimitPPS: 1000, BlockDuration: 60},
+		},
+		Trust: TrustConfig{
+			MinScoreForExemption: 60,
+		},
+		Performance: PerformanceConfig{
+			Shards:           64,
+			CleanupInterval:  60,
+			StatsTTL:         300,
+			ProfilerInterval: 30,
+		},
+	}
+}
+
+func Load(path string) (Config, error) {
+	cfg := Default()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return Config{}, fmt.Errorf("read %s: %w", path, err)
+	}
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return Config{}, fmt.Errorf("parse %s: %w", path, err)
+	}
+	cfg.applyDefaults()
+	return cfg, nil
+}
+
+func (c Config) CollectorAddr() string {
+	return fmt.Sprintf("%s:%d", c.SFlow.Collector.IP, c.SFlow.Collector.UDPPort)
+}
+
+func (c *Config) applyDefaults() {
+	def := Default()
+	if c.SFlow.Sampling <= 0 { c.SFlow.Sampling = def.SFlow.Sampling }
+	if c.SFlow.Collector.IP == "" { c.SFlow.Collector.IP = def.SFlow.Collector.IP }
+	if c.SFlow.Collector.UDPPort <= 0 { c.SFlow.Collector.UDPPort = def.SFlow.Collector.UDPPort }
+	if c.HTTP.Listen == "" { c.HTTP.Listen = def.HTTP.Listen }
+	if c.Store.MaxRecentPackets <= 0 { c.Store.MaxRecentPackets = def.Store.MaxRecentPackets }
+	if len(c.Local.OwnedCIDRs) == 0 {
+		c.Local.OwnedCIDRs = append([]string(nil), def.Local.OwnedCIDRs...)
+	}
+	if c.Detection.Sensitivity == "" { c.Detection.Sensitivity = "balanced" }
+	if c.Detection.NetworkType == "" { c.Detection.NetworkType = "home" }
+	
+	if c.Protocols.FTP.MaxPPS <= 0 { c.Protocols.FTP.MaxPPS = def.Protocols.FTP.MaxPPS }
+	if c.Protocols.FTP.RateLimitPPS == 0 { c.Protocols.FTP.RateLimitPPS = def.Protocols.FTP.RateLimitPPS }
+	if c.Protocols.FTP.BlockDuration == 0 { c.Protocols.FTP.BlockDuration = def.Protocols.FTP.BlockDuration }
+
+	if c.Protocols.FTPData.MaxPPS <= 0 { c.Protocols.FTPData.MaxPPS = def.Protocols.FTPData.MaxPPS }
+	if c.Protocols.FTPData.RateLimitPPS == 0 { c.Protocols.FTPData.RateLimitPPS = def.Protocols.FTPData.RateLimitPPS }
+	if c.Protocols.FTPData.BlockDuration == 0 { c.Protocols.FTPData.BlockDuration = def.Protocols.FTPData.BlockDuration }
+
+	if c.Trust.MinScoreForExemption == 0 { c.Trust.MinScoreForExemption = def.Trust.MinScoreForExemption }
+
+	if c.Performance.Shards <= 0 { c.Performance.Shards = def.Performance.Shards }
+	if c.Performance.CleanupInterval <= 0 { c.Performance.CleanupInterval = def.Performance.CleanupInterval }
+	if c.Performance.StatsTTL <= 0 { c.Performance.StatsTTL = def.Performance.StatsTTL }
+	if c.Performance.ProfilerInterval <= 0 { c.Performance.ProfilerInterval = def.Performance.ProfilerInterval }
+}
+
+func (c *Config) Validate() error {
+	if c.SFlow.Collector.UDPPort == 0 {
+		return fmt.Errorf("sflow collector udp port cannot be 0")
+	}
+	if len(c.Local.OwnedCIDRs) == 0 {
+		return fmt.Errorf("no owned CIDRs defined")
+	}
+	for _, cidr := range c.Local.OwnedCIDRs {
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			return fmt.Errorf("invalid CIDR %s: %v", cidr, err)
+		}
+	}
+	if c.HTTP.Listen == "" {
+		return fmt.Errorf("HTTP listen address cannot be empty")
+	}
+	return nil
+}
+
+func (c Config) OwnedNetworks() ([]*net.IPNet, error) {
+	out := make([]*net.IPNet, 0, len(c.Local.OwnedCIDRs))
+	for _, cidr := range c.Local.OwnedCIDRs {
+		_, network, err := net.ParseCIDR(cidr)
+		if err != nil {
+			return nil, fmt.Errorf("parse local owned cidr %q: %w", cidr, err)
+		}
+		out = append(out, network)
+	}
+	return out, nil
+}
+
+
+================================================================================
+FILE: config.json
+================================================================================
+{
+  "sflow": {
+    "sampling": 1,
+    "polling": 30,
+    "collector": {
+      "ip": "0.0.0.0",
+      "udpport": 6343
+    }
+  },
+  "http": {
+    "listen": "127.0.0.1:8080"
+  },
+  "store": {
+    "max_recent_packets": 20000
+  },
+  "performance": {
+    "shards": 16,
+    "cleanup_interval": 60,
+    "stats_ttl": 300,
+    "profiler_interval": 30
+  },
+  "local": {
+    "owned_cidrs": ["127.0.0.0/8", "192.168.0.0/24"],
+    "trusted_ips": ["1.1.1.1", "192.168.0.1"]
+  },
+  "alert": {
+    "discord_webhook_url": ""
+  },
+  "detection": {
+    "sensitivity": "balanced",
+    "network_type": "home"
+  },
+  "bgp": {
+    "enabled": false,
+    "local_as": 65000,
+    "peer_ip": "192.168.0.1",
+    "peer_as": 65001,
+    "community": "65000:666",
+    "next_hop": "192.168.0.103"
+  },
+  "mitigation": {
+    "blocklist_path": "blocklists/",
+    "auto_block": false
+  },
+  "protocols_tuning": {
+    "ftp": {
+      "max_pps": 1000,
+      "ratelimit_pps": 250,
+      "block_duration": 60
+    },
+    "ftp_data": {
+      "max_pps": 5000,
+      "ratelimit_pps": 1000,
+      "block_duration": 60
+    }
+  },
+  "trust_tuning": {
+    "min_score_for_exemption": 60
+  }
+}
+
+
+================================================================================
+FILE: main.go
+================================================================================
+package main
+
+import (
+	"dolly-sensor/app"
+	"log"
+)
+
+func main() {
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+
+	if err := app.Run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+
+================================================================================
+FILE: mitigation/bgp.go
+================================================================================
+package mitigation
+
+import (
+	"dolly-sensor/config"
+	"dolly-sensor/packet"
+	"fmt"
+	"log"
+	"os/exec"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+type BGPAnnouncement struct {
+	ID        string    `json:"id"`
+	Prefix    string    `json:"prefix"`
+	Type      string    `json:"type"` // "RTBH" o "Flowspec"
+	Details   string    `json:"details"`
+	Community string    `json:"community"`
+	Time      time.Time `json:"time"`
+}
+
+// BGPManager maneja la interacción con GoBGP para anunciar bloqueos
+type BGPManager struct {
+	cfg           config.BGPConfig
+	announcements map[string]BGPAnnouncement
+	mu            sync.RWMutex
+	// Inyectable para tests
+	Executor func(args []string) error
+}
+
+func NewBGPManager(cfg config.BGPConfig) *BGPManager {
+	m := &BGPManager{
+		cfg:           cfg,
+		announcements: make(map[string]BGPAnnouncement),
+	}
+	// Ejecutor por defecto (GoBGP real)
+	m.Executor = m.runGoBGP
+	return m
+}
+
+// AnnounceBlock lanza un comando gobgp para anunciar un RTBH (/32)
+func (b *BGPManager) AnnounceBlock(ip string, duration int) error {
+	prefix := ip + "/32"
+
+	b.mu.Lock()
+	b.announcements[prefix] = BGPAnnouncement{
+		ID:        prefix,
+		Prefix:    prefix,
+		Type:      "RTBH",
+		Details:   "Full IP block (RTBH)",
+		Community: b.cfg.Community,
+		Time:      time.Now(),
+	}
+	b.mu.Unlock()
+
+	args := []string{"global", "rib", "add", "-a", "ipv4", prefix}
+	if b.cfg.Community != "" {
+		args = append(args, "community", b.cfg.Community)
+	}
+	if b.cfg.NextHop != "" {
+		args = append(args, "nexthop", b.cfg.NextHop)
+	}
+
+	err := b.Executor(args)
+	if err != nil {
+		return err
+	}
+
+	// Si tiene duración, programar retirada
+	if duration > 0 {
+		go func() {
+			time.Sleep(time.Duration(duration) * time.Second)
+			log.Printf("[BGP] Auto-withdrawing RTBH %s after %ds", prefix, duration)
+			if err := b.WithdrawBlock(ip); err != nil {
+				log.Printf("[BGP] Failed to auto-withdraw RTBH %s: %v", prefix, err)
+			}
+		}()
+	}
+
+	return nil
+}
+
+// WithdrawBlock retira un anuncio RTBH
+func (b *BGPManager) WithdrawBlock(ip string) error {
+	prefix := ip + "/32"
+
+	b.mu.Lock()
+	delete(b.announcements, prefix)
+	b.mu.Unlock()
+
+	args := []string{"global", "rib", "del", "-a", "ipv4", prefix}
+	return b.Executor(args)
+}
+
+// AnnounceFlowspec lanza un comando gobgp con la receta detallada del filtro
+func (b *BGPManager) AnnounceFlowspec(m packet.Mitigation) error {
+	if m.SourceIP == "" {
+		return fmt.Errorf("missing source IP for flowspec")
+	}
+
+	id := fmt.Sprintf("flow-%s-%s", m.Name, m.SourceIP)
+
+	b.mu.Lock()
+	b.announcements[id] = BGPAnnouncement{
+		ID:        id,
+		Prefix:    m.SourceIP,
+		Type:      "Flowspec",
+		Details:   fmt.Sprintf("%s: %s", m.Name, m.Reason),
+		Community: "Flowspec Action",
+		Time:      time.Now(),
+	}
+	b.mu.Unlock()
+
+	// Construir comando GoBGP Flowspec
+	args := []string{"global", "rib", "add", "-a", "ipv4-flowspec", "match", "source", m.SourceIP + "/32"}
+
+	if m.DestIP != "" {
+		args = append(args, "destination", m.DestIP+"/32")
+	}
+	if m.Protocol != "" {
+		args = append(args, "protocol", strings.ToLower(m.Protocol))
+	}
+	if m.DestPort != 0 {
+		args = append(args, "destination-port", strconv.Itoa(int(m.DestPort)))
+	}
+	if m.SourcePort != 0 {
+		args = append(args, "source-port", strconv.Itoa(int(m.SourcePort)))
+	}
+	if m.PacketLenMin > 0 || m.PacketLenMax > 0 {
+		lenMatch := ""
+		if m.PacketLenMin > 0 && m.PacketLenMax > 0 {
+			lenMatch = fmt.Sprintf(">=%d&<=%d", m.PacketLenMin, m.PacketLenMax)
+		} else if m.PacketLenMin > 0 {
+			lenMatch = fmt.Sprintf(">=%d", m.PacketLenMin)
+		} else {
+			lenMatch = fmt.Sprintf("<=%d", m.PacketLenMax)
+		}
+		args = append(args, "packet-length", lenMatch)
+	}
+
+	// Acción técnica
+	if m.RateLimit > 0 {
+		args = append(args, "then", "rate-limit", strconv.Itoa(int(m.RateLimit)))
+	} else {
+		args = append(args, "then", "discard")
+	}
+
+	if !b.cfg.Enabled {
+		log.Printf("[BGP] Simulation: %s", strings.Join(args, " "))
+	} else {
+		err := b.Executor(args)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Si tiene duración, programar la retirada
+	if m.Duration > 0 {
+		go func() {
+			time.Sleep(time.Duration(m.Duration) * time.Second)
+			log.Printf("[BGP] Auto-withdrawing rule %s after %ds", id, m.Duration)
+			if err := b.WithdrawFlowspec(m); err != nil {
+				log.Printf("[BGP] Failed to auto-withdraw flowspec %s: %v", id, err)
+			}
+		}()
+	}
+
+	return nil
+}
+
+// WithdrawFlowspec retira una regla de Flowspec previamente anunciada
+func (b *BGPManager) WithdrawFlowspec(m packet.Mitigation) error {
+	id := fmt.Sprintf("flow-%s-%s", m.Name, m.SourceIP)
+
+	b.mu.Lock()
+	delete(b.announcements, id)
+	b.mu.Unlock()
+
+	args := []string{"global", "rib", "del", "-a", "ipv4-flowspec", "match", "source", m.SourceIP + "/32"}
+
+	if m.DestIP != "" {
+		args = append(args, "destination", m.DestIP+"/32")
+	}
+	if m.Protocol != "" {
+		args = append(args, "protocol", strings.ToLower(m.Protocol))
+	}
+	if m.DestPort != 0 {
+		args = append(args, "destination-port", strconv.Itoa(int(m.DestPort)))
+	}
+
+	if !b.cfg.Enabled {
+		log.Printf("[BGP] Simulation: (Withdraw) %s", strings.Join(args, " "))
+		return nil
+	}
+
+	return b.Executor(args)
+}
+
+func (b *BGPManager) runGoBGP(args []string) error {
+	cmd := exec.Command("gobgp", args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("gobgp error: %v, output: %s", err, string(output))
+	}
+	return nil
+}
+
+func (b *BGPManager) GetAnnouncements() []BGPAnnouncement {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	out := make([]BGPAnnouncement, 0, len(b.announcements))
+	for _, a := range b.announcements {
+		out = append(out, a)
+	}
+	return out
+}
+
+================================================================================
+FILE: mitigation/bgp_test.go
+================================================================================
+package mitigation
+
+import (
+	"dolly-sensor/config"
+	"dolly-sensor/packet"
+	"sync"
+	"testing"
+	"time"
+)
+
+func TestBGPAutoWithdraw(t *testing.T) {
+	cfg := config.BGPConfig{Enabled: true}
+	mgr := NewBGPManager(cfg)
+
+	var mu sync.Mutex
+	calls := []string{}
+	mgr.Executor = func(args []string) error {
+		mu.Lock()
+		calls = append(calls, args[2]) // "add" o "del"
+		mu.Unlock()
+		return nil
+	}
+
+	m := packet.Mitigation{
+		SourceIP: "1.1.1.1",
+		Name:     "TEST-RULE",
+		Duration: 1, // 1 segundo
+	}
+
+	err := mgr.AnnounceFlowspec(m)
+	if err != nil {
+		t.Fatalf("Error en AnnounceFlowspec: %v", err)
+	}
+
+	// Verificar anuncio inmediato
+	mu.Lock()
+	if len(calls) != 1 || calls[0] != "add" {
+		t.Errorf("Se esperaba 1 llamada 'add', obtenidas: %v", calls)
+	}
+	mu.Unlock()
+
+	// Esperar a la retirada (1.1s para margen)
+	time.Sleep(1200 * time.Millisecond)
+
+	mu.Lock()
+	if len(calls) != 2 || calls[1] != "del" {
+		t.Errorf("Se esperaba 2 llamadas (add + del), obtenidas: %v", calls)
+	}
+	mu.Unlock()
+}
+
+
+================================================================================
+FILE: mitigation/blocklist.go
+================================================================================
+package mitigation
+
+import (
+	"bufio"
+	"log"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+)
+
+// BlocklistEngine maneja grandes listas de IPs y CIDRs para bloqueo
+type BlocklistEngine struct {
+	mu       sync.RWMutex
+	ips      map[string]struct{}
+	networks []*net.IPNet
+	path     string
+
+	// Para no disparar BGP repetidamente para la misma IP
+	triggered   map[string]bool
+	triggeredMu sync.Mutex
+}
+
+func NewBlocklistEngine() *BlocklistEngine {
+	return &BlocklistEngine{
+		ips:       make(map[string]struct{}),
+		triggered: make(map[string]bool),
+	}
+}
+
+// LoadFromPath lee todos los archivos .txt o .list de una carpeta y carga las IPs
+func (e *BlocklistEngine) LoadFromPath(path string) error {
+	e.mu.Lock()
+	e.path = path
+	e.mu.Unlock()
+
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return os.MkdirAll(path, 0755)
+	}
+
+	files, err := os.ReadDir(path)
+	if err != nil {
+		return err
+	}
+
+	newIPs := make(map[string]struct{})
+	var newNets []*net.IPNet
+
+	for _, f := range files {
+		if f.IsDir() {
+			continue
+		}
+		fullPath := filepath.Join(path, f.Name())
+		e.parseFile(fullPath, newIPs, &newNets)
+	}
+
+	e.mu.Lock()
+	e.ips = newIPs
+	e.networks = newNets
+	e.mu.Unlock()
+
+	log.Printf("[BLOCKLIST] Loaded %d IPs and %d CIDRs from %s", len(newIPs), len(newNets), path)
+	return nil
+}
+
+func (e *BlocklistEngine) parseFile(path string, ips map[string]struct{}, nets *[]*net.IPNet) {
+	file, err := os.Open(path)
+	if err != nil {
+		log.Printf("[BLOCKLIST] Error opening %s: %v", path, err)
+		return
+	}
+	defer func() {
+		if cerr := file.Close(); cerr != nil {
+			log.Printf("[BLOCKLIST] Error closing %s: %v", path, cerr)
+		}
+	}()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		if strings.Contains(line, "/") {
+			_, ipnet, err := net.ParseCIDR(line)
+			if err == nil {
+				*nets = append(*nets, ipnet)
+			}
+		} else {
+			ip := net.ParseIP(line)
+			if ip != nil {
+				ips[ip.String()] = struct{}{}
+			}
+		}
+	}
+}
+
+// Count retorna el total de entradas cargadas
+func (e *BlocklistEngine) Count() int {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return len(e.ips) + len(e.networks)
+}
+
+// IsBlocked verifica si una IP está en la lista negra
+func (e *BlocklistEngine) IsBlocked(ipStr string) bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	if _, ok := e.ips[ipStr]; ok {
+		return true
+	}
+
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+	for _, network := range e.networks {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// AddManualBlock añade una IP o CIDR al archivo manual.list y recarga
+func (e *BlocklistEngine) AddManualBlock(entry string) error {
+	e.mu.RLock()
+	basePath := e.path
+	e.mu.RUnlock()
+
+	if basePath == "" {
+		basePath = "blocklists/"
+	}
+	filePath := filepath.Join(basePath, "manual.list")
+
+	f, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := f.Close(); cerr != nil {
+			log.Printf("[BLOCKLIST] Error closing %s: %v", filePath, cerr)
+		}
+	}()
+
+	if _, err := f.WriteString(entry + "\n"); err != nil {
+		return err
+	}
+	return e.LoadFromPath(basePath)
+}
+
+// GetFiles retorna la lista de archivos en la carpeta de blocklists
+func (e *BlocklistEngine) GetFiles() []string {
+	e.mu.RLock()
+	basePath := e.path
+	e.mu.RUnlock()
+
+	files, err := os.ReadDir(basePath)
+	if err != nil {
+		return nil
+	}
+
+	var out []string
+	for _, f := range files {
+		if !f.IsDir() && !strings.HasPrefix(f.Name(), ".") {
+			out = append(out, f.Name())
+		}
+	}
+	return out
+}
+
+// MarkTriggered marca una IP como ya procesada por BGP para evitar spam
+func (e *BlocklistEngine) MarkTriggered(ip string) bool {
+	e.triggeredMu.Lock()
+	defer e.triggeredMu.Unlock()
+	if e.triggered[ip] {
+		return false
+	}
+	e.triggered[ip] = true
+	return true
+}
+
+func (e *BlocklistEngine) ClearTriggered(ip string) {
+	e.triggeredMu.Lock()
+	defer e.triggeredMu.Unlock()
+	delete(e.triggered, ip)
+}
+
+================================================================================
+FILE: mitigation/blocklist_test.go
+================================================================================
+package mitigation
+
+import (
+	"testing"
+)
+
+func TestBlocklist(t *testing.T) {
+	e := NewBlocklistEngine()
+
+	// 1. Test Triggered logic
+	if !e.MarkTriggered("test-1") {
+		t.Error("Debería haber marcado como triggered por primera vez")
+	}
+	if e.MarkTriggered("test-1") {
+		t.Error("No debería permitir marcar dos veces lo mismo")
+	}
+
+	e.ClearTriggered("test-1")
+	if !e.MarkTriggered("test-1") {
+		t.Error("Debería permitir marcar de nuevo tras el Clear")
+	}
+
+	// 2. Test IPs (Simulando carga manual)
+	e.ips["1.2.3.4"] = struct{}{}
+	if !e.IsBlocked("1.2.3.4") {
+		t.Error("IP 1.2.3.4 debería estar bloqueada")
+	}
+	if e.IsBlocked("8.8.8.8") {
+		t.Error("IP 8.8.8.8 NO debería estar bloqueada")
+	}
+}
+
+
+================================================================================
+FILE: packet/event.go
+================================================================================
+package packet
+
+import (
+	"fmt"
+	"time"
+)
+
+type Event struct {
+	ID                 int64     `json:"id"`
+	Timestamp          time.Time `json:"timestamp"`
+	AgentIP            string    `json:"agent_ip"`
+	RemoteAddr         string    `json:"remote_addr"`
+	DatagramSequence   uint32    `json:"datagram_sequence"`
+	SampleSequence     uint32    `json:"sample_sequence"`
+	SampleType         string    `json:"sample_type"`
+	SourceID           string    `json:"source_id"`
+	Input              string    `json:"input"`
+	Output             string    `json:"output"`
+	SamplingRate       uint32    `json:"sampling_rate"`
+	SamplePool         uint32    `json:"sample_pool"`
+	Drops              uint32    `json:"drops"`
+	RecordIndex        uint32    `json:"record_index"`
+	HeaderProtocol     uint32    `json:"header_protocol"`
+	FrameLength        uint32    `json:"frame_length"`
+	Stripped           uint32    `json:"stripped"`
+	HeaderLength       uint32    `json:"header_length"`
+	DstMAC             string    `json:"dst_mac"`
+	SrcMAC             string    `json:"src_mac"`
+	EtherType          string    `json:"ether_type"`
+	Network            string    `json:"network"`
+	Protocol           string    `json:"protocol"`
+	Details            string    `json:"details"`
+	SrcIP              string    `json:"src_ip"`
+	DstIP              string    `json:"dst_ip"`
+	TTL                uint8     `json:"ttl"`
+	IPFlags            string    `json:"ip_flags"`
+	FragOffset         uint16    `json:"frag_offset"`
+	IPTotalLen         uint16    `json:"ip_total_len"`
+	MaxMTU             uint16    `json:"max_mtu"`
+	IPProtocol         string    `json:"ip_protocol"`
+	Transport          string    `json:"transport"`
+	SrcPort            uint16    `json:"src_port"`
+	DstPort            uint16    `json:"dst_port"`
+	TCPSeq             uint32    `json:"tcp_seq"`
+	TCPAck             uint32    `json:"tcp_ack"`
+	TCPFlags           string    `json:"tcp_flags"`
+	HandshakeComplete  bool      `json:"handshake_complete"`
+	HandshakeStep      int       `json:"handshake_step"`
+	InEstablishedSession bool    `json:"in_established_session"`
+	ARPSourceIP        string    `json:"arp_source_ip"`
+	ARPTargetIP        string    `json:"arp_target_ip"`
+	ICMPType           string    `json:"icmp_type"`
+	DNSQuery           string    `json:"dns_query"`
+	HTTPStartLine      string    `json:"http_start_line"`
+	SSHBanner          string    `json:"ssh_banner"`
+	FilterName         string    `json:"filter_name"`
+	FilterAction       string    `json:"filter_action"`
+	FilterReason       string    `json:"filter_reason"`
+	Allowed            bool      `json:"allowed"`
+	Alert              bool      `json:"alert"`
+	AlertName          string    `json:"alert_name"`
+	AlertReason        string    `json:"alert_reason"`
+	CurrentPPS         float64   `json:"current_pps"`
+	SourcePPS          float64   `json:"source_pps"`
+	SourceTrustScore   int       `json:"source_trust_score"`
+	BaselinePPS        float64   `json:"baseline_pps"`
+	SpikePPS           float64   `json:"spike_pps"`
+	ProfileActive      bool      `json:"profile_active"`
+	ProfileKey         string    `json:"profile_key"`
+	DestinationIsLocal bool      `json:"destination_is_local"`
+	PayloadHex         string    `json:"payload_hex"`
+	Summary            string    `json:"summary"`
+}
+
+func (e Event) BestProtocol() string {
+	if e.Protocol != "" {
+		return e.Protocol
+	}
+	if e.Transport != "" {
+		return e.Transport
+	}
+	if e.IPProtocol != "" {
+		return e.IPProtocol
+	}
+	if e.Network != "" {
+		return e.Network
+	}
+	return "-"
+}
+
+func (e Event) SummaryString() string {
+	base := fmt.Sprintf("%s sample=%d record=%d", e.SampleType, e.SampleSequence, e.RecordIndex)
+	proto := e.BestProtocol()
+
+	if e.SrcIP != "" || e.DstIP != "" {
+		addr := fmt.Sprintf("%s:%d -> %s:%d", zeroIfEmpty(e.SrcIP), e.SrcPort, zeroIfEmpty(e.DstIP), e.DstPort)
+		if e.Details != "" {
+			return fmt.Sprintf("%s %s %s %s [%s]", base, proto, addr, e.Details, e.FilterAction)
+		}
+		return fmt.Sprintf("%s %s %s [%s]", base, proto, addr, e.FilterAction)
+	}
+
+	if e.Protocol == "ARP" {
+		if e.Details != "" {
+			return fmt.Sprintf("%s %s %s [%s]", base, e.Protocol, e.Details, e.FilterAction)
+		}
+		return fmt.Sprintf("%s %s [%s]", base, e.Protocol, e.FilterAction)
+	}
+
+	return fmt.Sprintf("%s proto=%s frameLen=%d [%s]", base, zeroIfEmpty(proto), e.FrameLength, e.FilterAction)
+}
+
+func zeroIfEmpty(v string) string {
+	if v == "" {
+		return "-"
+	}
+	return v
+}
+
+
+================================================================================
+FILE: packet/mitigation.go
+================================================================================
+package packet
+
+// Mitigation representa una decisión de bloqueo o acción técnica tomada por un filtro
+type Mitigation struct {
+	Alert  bool   `json:"alert"`
+	Name   string `json:"name"`
+	Reason string `json:"reason"`
+	Block  bool   `json:"block"`
+	
+	// Receta de Bloqueo (Flowspec Ready)
+	SourceIP      string `json:"source_ip"`
+	DestIP        string `json:"dest_ip"`
+	Protocol      string `json:"protocol"` // "TCP", "UDP", etc
+	SourcePort    uint16 `json:"source_port"`
+	DestPort      uint16 `json:"dest_port"`
+	PacketLenMin  uint16 `json:"packet_len_min"`
+	PacketLenMax  uint16 `json:"packet_len_max"`
+	
+	// Tipo de acción técnica
+	Drop          bool   `json:"drop"`
+	RateLimit     uint32 `json:"rate_limit"` // PPS si no es drop total
+	Duration      int    `json:"duration"`   // Segundos antes de retirar la regla
+}
+
+
+================================================================================
+FILE: packet/profile.go
+================================================================================
+package packet
+
+import (
+	"dolly-sensor/trustscore"
+	"sync"
+	"time"
+)
+
+type IPProfile struct {
+	IP             string    `json:"ip"`
+	LastUpdated    time.Time `json:"last_updated"`
+
+	// 1. Entropía y Diversidad
+	SourceDiversity float64   `json:"source_diversity_index"` // unique_ips / total_packets
+	UniqueSources   int       `json:"unique_sources"`
+
+	// 2. Ratios de Conexión
+	SYNAckRatio    float64   `json:"syn_ack_ratio"` // SYNs / (ACKs + 1)
+	TCPFlagsCount  map[string]int `json:"tcp_flags_distribution"`
+
+	// 3. Distribución de Tamaños (Histograma)
+	SizeDistribution struct {
+		Small  int `json:"64_128b"`
+		Medium int `json:"129_512b"`
+		Large  int `json:"513_1500b"`
+	} `json:"packet_size_distribution"`
+
+	// 4. Huellas de TTL
+	TopTTLs map[uint8]int `json:"top_ttl_fingerprints"`
+
+	// 5. Baselines (Volumen)
+	CurrentPPS float64 `json:"current_pps"`
+	CurrentMbps float64 `json:"current_mbps"`
+
+	// Metadata para alertas
+	IsAnomalous        bool    `json:"is_anomalous"`
+	RiskScore          int     `json:"risk_score"`
+	TrustedTrafficRatio float64 `json:"trusted_traffic_ratio"`
+}
+
+// PersistentProfile representa el estado a largo plazo de una IP nuestra en data/IP.json
+type PersistentProfile struct {
+	mu          sync.RWMutex `json:"-"`
+	IP          string       `json:"ip"`
+	FirstSeen   time.Time    `json:"first_seen"`
+	LastUpdated time.Time    `json:"last_updated"`
+
+	StatsHistoricas struct {
+		MaxPPS                float64 `json:"max_pps"`
+		MaxMbps               float64 `json:"max_mbps"`
+		TotalPacketsProcessed uint64  `json:"total_packets_processed"`
+		TotalBytesProcessed   uint64  `json:"total_bytes_processed"`
+	} `json:"stats_historicas"`
+
+	DistribucionFlagsTotal map[string]uint64 `json:"distribucion_flags_total"`
+	ProtocolosFrecuentes   map[string]uint64 `json:"protocolos_frecuentes"`
+	DistribucionTTL        map[uint8]uint64  `json:"distribucion_ttl"`
+
+	// Reputación de orígenes específica para esta IP de destino (Migrado a TrustScore)
+	ReputacionOrigenes map[string]*trustscore.SourceTrust `json:"reputacion_origenes"`
+
+	PuertosFrecuentes       map[uint16]uint64 `json:"puertos_frecuentes"`
+	SourcePortsFrecuentes   map[uint16]uint64 `json:"source_ports_frecuentes"`
+
+	PerfilTrafico struct {
+		TTLDominante uint8 `json:"ttl_dominante"`
+		MTUPromedio  int   `json:"mtu_promedio"`
+	} `json:"perfil_trafico"`
+}
+
+func (p *PersistentProfile) Lock() { p.mu.Lock() }
+func (p *PersistentProfile) Unlock() { p.mu.Unlock() }
+func (p *PersistentProfile) RLock() { p.mu.RLock() }
+func (p *PersistentProfile) RUnlock() { p.mu.RUnlock() }
+
+
+================================================================================
+FILE: packet/protocols.go
+================================================================================
+package packet
+
+import (
+	"encoding/json"
+	"os"
+)
+
+type PortMapping struct {
+	Port  uint16   `json:"port,omitempty"`
+	Range []uint16 `json:"range,omitempty"`
+	Name  string   `json:"name"`
+}
+
+type ProtocolMap struct {
+	TCP []PortMapping `json:"TCP"`
+	UDP []PortMapping `json:"UDP"`
+}
+
+var GlobalProtocols ProtocolMap
+
+func LoadProtocols(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(data, &GlobalProtocols)
+}
+
+func (pm ProtocolMap) GetName(transport string, port uint16) string {
+	var list []PortMapping
+	switch transport {
+	case "TCP":
+		list = pm.TCP
+	case "UDP":
+		list = pm.UDP
+	}
+
+	for _, m := range list {
+		if m.Port != 0 && m.Port == port {
+			return m.Name
+		}
+		if len(m.Range) == 2 && port >= m.Range[0] && port <= m.Range[1] {
+			return m.Name
+		}
+	}
+	return ""
+}
+
+================================================================================
+FILE: profiler/profiler.go
+================================================================================
+package profiler
+
+import (
+	"dolly-sensor/config"
+	"dolly-sensor/packet"
+	"dolly-sensor/store"
+	"dolly-sensor/trustscore"
+	"encoding/json"
+	"log"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+)
+
+type Profiler struct {
+	store    *store.Store
+	cfg      config.Config
+	interval time.Duration
+	baseDir  string // profiles/
+	dataDir  string // data/
+
+	// Cache de perfiles persistentes en memoria
+	muCache sync.RWMutex
+	cache   map[string]*packet.PersistentProfile
+}
+
+func NewProfiler(s *store.Store, cfg config.Config, interval time.Duration) *Profiler {
+	baseDir := "profiles"
+	if err := os.MkdirAll(baseDir, 0755); err != nil {
+		log.Printf("[PROFILER] error creating profiles dir: %v", err)
+	}
+	dataDir := "data"
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		log.Printf("[PROFILER] error creating data dir: %v", err)
+	}
+
+	p := &Profiler{
+		store:    s,
+		cfg:      cfg,
+		interval: interval,
+		baseDir:  baseDir,
+		dataDir:  dataDir,
+		cache:    make(map[string]*packet.PersistentProfile),
+	}
+	p.warmupCache()
+	return p
+}
+
+func (p *Profiler) warmupCache() {
+	entries, err := os.ReadDir(p.dataDir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			ip := entry.Name()
+			if net.ParseIP(ip) != nil {
+				p.loadPersistentProfile(ip)
+			}
+		}
+	}
+	log.Printf("[PROFILER] Cache warmed up with %d profiles", len(p.cache))
+}
+
+func (p *Profiler) Start() {
+	log.Printf("[PROFILER] starting with interval %v", p.interval)
+	ticker := time.NewTicker(p.interval)
+	saveTicker := time.NewTicker(5 * time.Minute)
+
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				p.processAllDestinations()
+			case <-saveTicker.C:
+				p.saveAllToDisk()
+			}
+		}
+	}()
+}
+
+func (p *Profiler) saveAllToDisk() {
+	p.muCache.RLock()
+	ips := make([]string, 0, len(p.cache))
+	for ip := range p.cache {
+		ips = append(ips, ip)
+	}
+	p.muCache.RUnlock()
+
+	for _, ip := range ips {
+		p.muCache.RLock()
+		pers := p.cache[ip]
+		p.muCache.RUnlock()
+		if pers != nil {
+			p.savePersistentProfile(pers)
+		}
+	}
+}
+
+func (p *Profiler) processAllDestinations() {
+	packets := p.store.Snapshot()
+	if len(packets) == 0 {
+		return
+	}
+
+	byDest := make(map[string][]packet.Event)
+	cutoff := time.Now().Add(-p.interval)
+
+	for _, pkt := range packets {
+		if pkt.Timestamp.After(cutoff) && pkt.DstIP != "" {
+			byDest[pkt.DstIP] = append(byDest[pkt.DstIP], pkt)
+		}
+	}
+
+	for ip, pkts := range byDest {
+		pers := p.loadPersistentProfile(ip)
+		profile := p.calculateProfile(ip, pkts, pers)
+		p.updatePersistentProfile(pers, profile, pkts)
+		p.saveProfile(profile)
+	}
+}
+
+func (p *Profiler) calculateProfile(ip string, pkts []packet.Event, pers *packet.PersistentProfile) packet.IPProfile {
+	prof := packet.IPProfile{
+		IP:            ip,
+		LastUpdated:   time.Now(),
+		TCPFlagsCount: make(map[string]int),
+		TopTTLs:       make(map[uint8]int),
+	}
+
+	uniqueSources := make(map[string]struct{})
+	synCount, ackCount := 0, 0
+	var totalBytes uint64
+	var trustedPkts int
+
+	manualTrusted := make(map[string]bool)
+	for _, tip := range p.cfg.Local.TrustedIPs {
+		manualTrusted[tip] = true
+	}
+
+	pers.Lock()
+	defer pers.Unlock()
+
+	for _, pkt := range pkts {
+		isManual := manualTrusted[pkt.SrcIP]
+		rep, ok := pers.ReputacionOrigenes[pkt.SrcIP]
+		if !ok {
+			rep = &trustscore.SourceTrust{IP: pkt.SrcIP}
+			pers.ReputacionOrigenes[pkt.SrcIP] = rep
+		}
+
+		// Mapear packet.Event a trustscore.TrustEvent para evitar ciclos
+		ev := trustscore.TrustEvent{
+			Protocol:             pkt.Protocol,
+			BestProtocol:         pkt.BestProtocol(),
+			SrcPort:              pkt.SrcPort,
+			TCPFlags:             pkt.TCPFlags,
+			HandshakeComplete:    pkt.HandshakeComplete,
+			InEstablishedSession: pkt.InEstablishedSession,
+		}
+		trustscore.UpdateTrustScore(rep, ev, isManual)
+
+		if isManual || rep.TrustScore >= 70 {
+			trustedPkts++
+		}
+
+		if pkt.SrcIP != "" {
+			uniqueSources[pkt.SrcIP] = struct{}{}
+		}
+
+		if pkt.Transport == "TCP" {
+			flags := strings.ToUpper(pkt.TCPFlags)
+			if strings.Contains(flags, "SYN") {
+				synCount++
+			}
+			if strings.Contains(flags, "ACK") {
+				ackCount++
+			}
+			prof.TCPFlagsCount[flags]++
+		}
+
+		size := pkt.IPTotalLen
+		if size <= 128 {
+			prof.SizeDistribution.Small++
+		} else if size <= 512 {
+			prof.SizeDistribution.Medium++
+		} else {
+			prof.SizeDistribution.Large++
+		}
+
+		prof.TopTTLs[pkt.TTL]++
+		totalBytes += uint64(pkt.IPTotalLen)
+		if pkt.CurrentPPS > prof.CurrentPPS {
+			prof.CurrentPPS = pkt.CurrentPPS
+		}
+	}
+
+	totalPkts := len(pkts)
+	if totalPkts > 0 {
+		prof.UniqueSources = len(uniqueSources)
+		prof.SourceDiversity = float64(prof.UniqueSources) / float64(totalPkts)
+		prof.SYNAckRatio = float64(synCount) / float64(ackCount+1)
+		prof.TrustedTrafficRatio = float64(trustedPkts) / float64(totalPkts)
+		prof.CurrentMbps = (float64(totalBytes) * 8 / 1000000) / p.interval.Seconds()
+	}
+
+	if prof.SYNAckRatio > 10 {
+		prof.RiskScore += 20
+	}
+	if prof.SourceDiversity < 0.05 {
+		prof.RiskScore += 30
+	}
+	if prof.CurrentPPS > 10000 {
+		prof.RiskScore += 10
+	}
+
+	if prof.TrustedTrafficRatio > 0.8 {
+		prof.RiskScore /= 4
+		prof.IsAnomalous = false
+	} else if prof.RiskScore > 40 {
+		prof.IsAnomalous = true
+	}
+
+	return prof
+}
+
+func (p *Profiler) loadPersistentProfile(ip string) *packet.PersistentProfile {
+	p.muCache.RLock()
+	if pers, ok := p.cache[ip]; ok {
+		p.muCache.RUnlock()
+		return pers
+	}
+	p.muCache.RUnlock()
+
+	p.muCache.Lock()
+	defer p.muCache.Unlock()
+	if pers, ok := p.cache[ip]; ok {
+		return pers
+	}
+
+	path := filepath.Join(p.dataDir, ip, "ip.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		pers := &packet.PersistentProfile{
+			IP:                     ip,
+			FirstSeen:              time.Now(),
+			LastUpdated:            time.Now(),
+			DistribucionFlagsTotal: make(map[string]uint64),
+			ProtocolosFrecuentes:   make(map[string]uint64),
+			DistribucionTTL:        make(map[uint8]uint64),
+			ReputacionOrigenes:     make(map[string]*trustscore.SourceTrust),
+			PuertosFrecuentes:      make(map[uint16]uint64),
+			SourcePortsFrecuentes:  make(map[uint16]uint64),
+		}
+		p.cache[ip] = pers
+		return pers
+	}
+
+	var pers packet.PersistentProfile
+	if err := json.Unmarshal(raw, &pers); err != nil {
+		log.Printf("[PROFILER] error unmarshaling persistent profile %s: %v", ip, err)
+		pers = packet.PersistentProfile{
+			IP:        ip,
+			FirstSeen: time.Now(),
+		}
+	}
+	if pers.DistribucionFlagsTotal == nil {
+		pers.DistribucionFlagsTotal = make(map[string]uint64)
+	}
+	if pers.ProtocolosFrecuentes == nil {
+		pers.ProtocolosFrecuentes = make(map[string]uint64)
+	}
+	if pers.DistribucionTTL == nil {
+		pers.DistribucionTTL = make(map[uint8]uint64)
+	}
+	if pers.ReputacionOrigenes == nil {
+		pers.ReputacionOrigenes = make(map[string]*trustscore.SourceTrust)
+	}
+	if pers.PuertosFrecuentes == nil {
+		pers.PuertosFrecuentes = make(map[uint16]uint64)
+	}
+	if pers.SourcePortsFrecuentes == nil {
+		pers.SourcePortsFrecuentes = make(map[uint16]uint64)
+	}
+	p.cache[ip] = &pers
+	return &pers
+}
+
+func (p *Profiler) updatePersistentProfile(pers *packet.PersistentProfile, prof packet.IPProfile, pkts []packet.Event) {
+	pers.Lock()
+	defer pers.Unlock()
+
+	pers.LastUpdated = time.Now()
+	if prof.CurrentPPS > pers.StatsHistoricas.MaxPPS {
+		pers.StatsHistoricas.MaxPPS = prof.CurrentPPS
+	}
+	if prof.CurrentMbps > pers.StatsHistoricas.MaxMbps {
+		pers.StatsHistoricas.MaxMbps = prof.CurrentMbps
+	}
+
+	var intervalBytes uint64
+	for _, pkt := range pkts {
+		pers.ProtocolosFrecuentes[pkt.Transport]++
+		pers.DistribucionTTL[pkt.TTL]++
+
+		if pkt.Transport == "TCP" && pkt.TCPFlags != "" {
+			pers.DistribucionFlagsTotal[strings.ToUpper(pkt.TCPFlags)]++
+		}
+		if pkt.DstPort != 0 {
+			pers.PuertosFrecuentes[pkt.DstPort]++
+		}
+		if pkt.SrcPort != 0 {
+			pers.SourcePortsFrecuentes[pkt.SrcPort]++
+		}
+		intervalBytes += uint64(pkt.IPTotalLen)
+	}
+
+	pers.StatsHistoricas.TotalPacketsProcessed += uint64(len(pkts))
+	pers.StatsHistoricas.TotalBytesProcessed += intervalBytes
+
+	var maxCount int
+	for ttl, count := range prof.TopTTLs {
+		if count > maxCount {
+			maxCount = count
+			pers.PerfilTrafico.TTLDominante = ttl
+		}
+	}
+
+	trustscore.ApplyDecay(pers.ReputacionOrigenes)
+
+	now := time.Now()
+	for _, conn := range p.store.GetActiveConnections() {
+		if conn.DstIP == pers.IP {
+			rep, ok := pers.ReputacionOrigenes[conn.SrcIP]
+			if !ok {
+				rep = &trustscore.SourceTrust{IP: conn.SrcIP, FirstSeen: now, SeenDays: make(map[string]bool)}
+				pers.ReputacionOrigenes[conn.SrcIP] = rep
+			}
+
+			// Si la conexión está activa, significa que hubo un handshake exitoso.
+			// Si aún no hemos marcado el handshake en la reputación, lo hacemos ahora.
+			if !rep.HandshakeCompleted {
+				rep.HandshakeCompleted = true
+				rep.AddScoreEvent(10, "Verified Established Connection")
+				rep.LastHandshakeAward = now
+			}
+
+			// Premios por persistencia
+			duration := now.Sub(conn.StartTime)
+			if duration >= 15*time.Minute && (rep.Last15mAward.IsZero() || now.Sub(rep.Last15mAward) >= 15*time.Minute) {
+				rep.AddScoreEvent(5, "Active connection (15m)")
+				rep.Last15mAward = now
+			}
+			if duration >= 30*time.Minute && (rep.Last30mAward.IsZero() || now.Sub(rep.Last30mAward) >= 30*time.Minute) {
+				rep.AddScoreEvent(10, "Persistent session bonus (30m)")
+				rep.Last30mAward = now
+			}
+		}
+	}
+}
+
+func (p *Profiler) savePersistentProfile(pers *packet.PersistentProfile) {
+	pers.RLock()
+	defer pers.RUnlock()
+
+	dir := filepath.Join(p.dataDir, pers.IP)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		log.Printf("[PROFILER] error creating dir %s: %v", dir, err)
+		return
+	}
+
+	path := filepath.Join(dir, "ip.json")
+	data, err := json.MarshalIndent(pers, "", "  ")
+	if err != nil {
+		log.Printf("[PROFILER] error marshaling profile %s: %v", pers.IP, err)
+		return
+	}
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		log.Printf("[PROFILER] error writing %s: %v", path, err)
+	}
+}
+
+func (p *Profiler) SetManualTrust(dstIP, srcIP string, trust bool) error {
+	pers := p.loadPersistentProfile(dstIP)
+	pers.Lock()
+	defer pers.Unlock()
+
+	rep, ok := pers.ReputacionOrigenes[srcIP]
+	if !ok {
+		rep = &trustscore.SourceTrust{IP: srcIP, FirstSeen: time.Now(), SeenDays: make(map[string]bool)}
+		pers.ReputacionOrigenes[srcIP] = rep
+	}
+	rep.IsManualTrust = trust
+	rep.LastSeen = time.Now()
+	if trust {
+		rep.TrustScore = 100
+	} else {
+		rep.UpdateScore()
+	}
+
+	go p.savePersistentProfile(pers)
+	return nil
+}
+
+func (p *Profiler) GetAllReputations() map[string]*trustscore.SourceTrust {
+	p.muCache.RLock()
+	defer p.muCache.RUnlock()
+
+	allReps := make(map[string]*trustscore.SourceTrust)
+	for _, pers := range p.cache {
+		pers.RLock()
+		for srcIP, rep := range pers.ReputacionOrigenes {
+			if existing, ok := allReps[srcIP]; !ok || rep.TrustScore > existing.TrustScore {
+				// Copia profunda del objeto de confianza
+				copyRep := *rep
+				allReps[srcIP] = &copyRep
+			}
+		}
+		pers.RUnlock()
+	}
+	return allReps
+}
+
+func (p *Profiler) GetProfile(ip string) *packet.PersistentProfile {
+	pers := p.loadPersistentProfile(ip)
+
+	// Crear una copia profunda para evitar "concurrent map iteration and map write"
+	pers.RLock()
+	defer pers.RUnlock()
+
+	copyPers := &packet.PersistentProfile{
+		IP:          pers.IP,
+		FirstSeen:   pers.FirstSeen,
+		LastUpdated: pers.LastUpdated,
+	}
+	copyPers.StatsHistoricas = pers.StatsHistoricas
+	copyPers.PerfilTrafico = pers.PerfilTrafico
+
+	// Copiar mapas uno a uno (Deep Copy)
+	copyPers.DistribucionFlagsTotal = make(map[string]uint64)
+	for k, v := range pers.DistribucionFlagsTotal {
+		copyPers.DistribucionFlagsTotal[k] = v
+	}
+
+	copyPers.ProtocolosFrecuentes = make(map[string]uint64)
+	for k, v := range pers.ProtocolosFrecuentes {
+		copyPers.ProtocolosFrecuentes[k] = v
+	}
+
+	copyPers.DistribucionTTL = make(map[uint8]uint64)
+	for k, v := range pers.DistribucionTTL {
+		copyPers.DistribucionTTL[k] = v
+	}
+
+	copyPers.PuertosFrecuentes = make(map[uint16]uint64)
+	for k, v := range pers.PuertosFrecuentes {
+		copyPers.PuertosFrecuentes[k] = v
+	}
+
+	copyPers.SourcePortsFrecuentes = make(map[uint16]uint64)
+	for k, v := range pers.SourcePortsFrecuentes {
+		copyPers.SourcePortsFrecuentes[k] = v
+	}
+
+	copyPers.ReputacionOrigenes = make(map[string]*trustscore.SourceTrust)
+	for k, v := range pers.ReputacionOrigenes {
+		// Aquí también necesitamos copiar el objeto de reputación porque el JSON encoder entrará en él
+		trust := *v
+		copyPers.ReputacionOrigenes[k] = &trust
+	}
+
+	return copyPers
+}
+
+func (p *Profiler) saveProfile(prof packet.IPProfile) {
+	filename := filepath.Join(p.baseDir, prof.IP+".json")
+	data, err := json.MarshalIndent(prof, "", "  ")
+	if err != nil {
+		log.Printf("[PROFILER] error marshaling profile %s: %v", prof.IP, err)
+		return
+	}
+	if err := os.WriteFile(filename, data, 0644); err != nil {
+		log.Printf("[PROFILER] error writing %s: %v", filename, err)
+	}
+}
+
+
+================================================================================
+FILE: project_dump.txt
+================================================================================
+
+
+================================================================================
+FILE: analyzer/global.go
+================================================================================
+package analyzer
+
+import (
+	"dolly-sensor/config"
+	"dolly-sensor/mitigation"
+	"dolly-sensor/packet"
+	"dolly-sensor/stateful"
+	"fmt"
+	"net"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+)
+
+const (
+	CooldownDiscord  = 10 * time.Minute
+	MaxProtocolosTop = 5
+)
+
+type PerfilGlobalIP struct {
+	IP               string    `json:"ip"`
+	CurrentMbps      float64   `json:"current_mbps"`
+	PromedioMbps     float64   `json:"promedio_mbps"`
+	DesvioMbps       float64   `json:"desvio_mbps"`
+	CurrentPPS       float64   `json:"current_pps"`
+	PromedioPPS      float64   `json:"promedio_pps"`
+	DesvioPPS        float64   `json:"desvio_pps"`
+	PuntajeAmenaza   int       `json:"puntaje_amenaza"`
+	Muestras         int       `json:"muestras"`
+	UltimaMuestra    time.Time `json:"ultima_muestra"`
+	ProtocolosTop    []string  `json:"protocolos_top"`
+}
+
+type thresholds struct {
+	SueloPPS       float64
+	ZScoreExtremo  float64
+	Persistencia   int
+	UmbralThreat   float64
+}
+
+type ResultadoEvaluacionInbound struct {
+	CoincideDestinoPropio bool
+	Alerta                bool
+	NombreAlerta          string
+	RazonAlerta           string
+	PPSActual             float64
+	PPSBase               float64
+	PPSThreshold          float64
+	SourcePPS             float64
+}
+
+type InboundProfileProvider interface {
+	GetProfile(ip string) *packet.PersistentProfile
+}
+
+type GlobalSummary struct {
+	TotalCurrentPPS  float64 `json:"total_current_pps"`
+	TotalCurrentMbps float64 `json:"total_current_mbps"`
+	TotalSamples     int     `json:"total_samples"`
+	ActiveTargets    int     `json:"active_targets"`
+}
+
+type analyzerShard struct {
+	mu            sync.Mutex
+	realtimePPS    map[string]*PerfilZScore
+	realtimeMbps   map[string]*PerfilZScore
+	sourcePPS      map[string]*PerfilZScore
+	sourceDestPPS  map[string]*PerfilZScore
+	puntajes       map[string]float64
+	contadores     map[string]int
+}
+
+type PerfilInboundGlobal struct {
+	ownedNets      []*net.IPNet
+	mu             sync.Mutex // Solo para alertCooldowns
+	alertCooldowns map[string]time.Time
+	
+	shards         []*analyzerShard
+	numShards      int
+
+	blocklist      *mitigation.BlocklistEngine
+	bgp            *mitigation.BGPManager
+	cfg            config.Config
+	profiler       InboundProfileProvider
+	HasConn        func(srcIP string, srcPort uint16, dstIP string, dstPort uint16) bool
+	ValidateTCP    func(pkt *packet.Event) stateful.SecurityCheck
+	ValidateTCPFlood func(pkt *packet.Event, syn, ack int) stateful.SecurityCheck
+}
+
+func NuevoPerfilInboundGlobal(ownedNets []*net.IPNet, bl *mitigation.BlocklistEngine, bgp *mitigation.BGPManager, cfg config.Config, prof InboundProfileProvider) *PerfilInboundGlobal {
+	numShards := cfg.Performance.Shards
+	p := &PerfilInboundGlobal{
+		ownedNets:      ownedNets,
+		alertCooldowns: make(map[string]time.Time),
+		blocklist:      bl,
+		bgp:            bgp,
+		cfg:            cfg,
+		profiler:       prof,
+		numShards:      numShards,
+		shards:         make([]*analyzerShard, numShards),
+	}
+	for i := 0; i < numShards; i++ {
+		p.shards[i] = &analyzerShard{
+			realtimePPS:   make(map[string]*PerfilZScore),
+			realtimeMbps:  make(map[string]*PerfilZScore),
+			sourcePPS:     make(map[string]*PerfilZScore),
+			sourceDestPPS: make(map[string]*PerfilZScore),
+			puntajes:      make(map[string]float64),
+			contadores:    make(map[string]int),
+		}
+	}
+	return p
+}
+
+func (p *PerfilInboundGlobal) getShard(ip string) *analyzerShard {
+	h := uint32(2166136261)
+	for i := 0; i < len(ip); i++ {
+		h *= 16777619
+		h ^= uint32(ip[i])
+	}
+	return p.shards[h%uint32(p.numShards)]
+}
+
+func (p *PerfilInboundGlobal) Evaluar(pkt *packet.Event, cfg config.Config) ResultadoEvaluacionInbound {
+	srcIP := pkt.SrcIP
+	dstIP := pkt.DstIP
+	protocolo := pkt.BestProtocol()
+	bytes := pkt.FrameLength
+	
+	sr := pkt.SamplingRate
+	if sr == 0 { sr = 1 }
+
+	if !p.esDestinoPropio(dstIP) {
+		return ResultadoEvaluacionInbound{}
+	}
+
+	// 1. Baseline & Z-Score Analysis (SHARDED por IP de destino)
+	shard := p.getShard(dstIP)
+	
+	thr := getDetectionThresholds(cfg.Detection.NetworkType, cfg.Detection.Sensitivity)
+	ahora := pkt.Timestamp
+	if ahora.IsZero() { ahora = time.Now() }
+
+	shard.mu.Lock()
+	pps, ok := shard.realtimePPS[dstIP]
+	if !ok { pps = NuevoPerfilZScore(); shard.realtimePPS[dstIP] = pps }
+	mbps, ok := shard.realtimeMbps[dstIP]
+	if !ok { mbps = NuevoPerfilZScore(); shard.realtimeMbps[dstIP] = mbps }
+	
+	var sdPPS *PerfilZScore
+	if srcIP != "" {
+		keySD := srcIP + "-" + dstIP
+		sdPPS, ok = shard.sourceDestPPS[keySD]
+		if !ok { sdPPS = NuevoPerfilZScore(); shard.sourceDestPPS[keySD] = sdPPS }
+	}
+	
+	resPPS := pps.ObservarConPeso(ahora, float64(sr))
+	realBytes := float64(bytes) * float64(sr)
+	resMbps := mbps.ObservarConPeso(ahora, (realBytes*8)/1_000_000)
+
+	var resSourceDestPPS ResultadoZScore
+	if sdPPS != nil {
+		resSourceDestPPS = sdPPS.ObservarConPeso(ahora, float64(sr))
+	}
+
+	pkt.CurrentPPS = resPPS.Actual
+	pkt.SourcePPS = resSourceDestPPS.Actual
+	shard.mu.Unlock()
+
+	// 2. Ejecutar el Pipeline de Filtros
+	if alert, name, reason := p.ExecutePipeline(pkt, cfg); alert {
+		return ResultadoEvaluacionInbound{
+			CoincideDestinoPropio: true,
+			Alerta:                true,
+			NombreAlerta:          name,
+			RazonAlerta:           reason,
+			PPSActual:             resPPS.Actual,
+			SourcePPS:             resSourceDestPPS.Actual,
+		}
+	}
+
+	puntos := 0.0
+	if resPPS.Actual > thr.SueloPPS { puntos += (resPPS.Actual - thr.SueloPPS) / 400.0 }
+	if resPPS.Desvio > 5.0 {
+		z := (resPPS.Actual - resPPS.Media) / resPPS.Desvio
+		if z > thr.ZScoreExtremo { puntos += 40.0 }
+	}
+	tamanioPromedio := realBytes / float64(sr)
+	proto := strings.ToUpper(protocolo)
+	if resPPS.Actual > thr.SueloPPS && (proto == "SYN" || proto == "UDP") && tamanioPromedio < 128 { puntos += 30.0 }
+
+	shard.mu.Lock()
+	shard.puntajes[dstIP] = (0.2 * puntos) + (0.8 * shard.puntajes[dstIP])
+	if shard.puntajes[dstIP] >= thr.UmbralThreat { shard.contadores[dstIP]++ } else { if shard.contadores[dstIP] > 0 { shard.contadores[dstIP]-- } }
+
+	resultado := ResultadoEvaluacionInbound{
+		CoincideDestinoPropio: true,
+		PPSActual:             resPPS.Actual,
+		PPSBase:               resPPS.Media,
+		PPSThreshold:          resPPS.Media + (thr.ZScoreExtremo * resPPS.Desvio),
+		SourcePPS:             resSourceDestPPS.Actual,
+	}
+
+	if shard.contadores[dstIP] >= thr.Persistencia {
+		p.mu.Lock()
+		lastAlert, onCooldown := p.alertCooldowns[dstIP]
+		if !onCooldown || ahora.Sub(lastAlert) > CooldownDiscord {
+			p.alertCooldowns[dstIP] = ahora
+			p.mu.Unlock()
+			resultado.Alerta = true
+			resultado.NombreAlerta = "🔥 DDOS-ATTACK-CONFIRMED"
+			resultado.RazonAlerta = fmt.Sprintf("ATAQUE DETECTADO (%s/%s): PPS=%.0f Mbps=%.1f Proto=%s", cfg.Detection.NetworkType, cfg.Detection.Sensitivity, resPPS.Actual, resMbps.Actual, proto)
+			shard.contadores[dstIP] = 0
+		} else { p.mu.Unlock() }
+	}
+	shard.mu.Unlock()
+
+	return resultado
+}
+
+func getDetectionThresholds(netType, sensitivity string) thresholds {
+	t := thresholds{ SueloPPS: 8000.0, ZScoreExtremo: 12.0, Persistencia: 15, UmbralThreat: 100.0 }
+	switch strings.ToLower(netType) {
+	case "home": t.SueloPPS = 5000.0
+	case "office": t.SueloPPS = 25000.0
+	case "datacenter": t.SueloPPS = 100000.0
+	}
+	switch strings.ToLower(sensitivity) {
+	case "relaxed": t.ZScoreExtremo = 25.0; t.Persistencia = 15; t.UmbralThreat = 150.0
+	case "balanced": t.ZScoreExtremo = 12.0; t.Persistencia = 8; t.UmbralThreat = 100.0
+	case "aggressive": t.ZScoreExtremo = 6.0; t.Persistencia = 5; t.UmbralThreat = 60.0
+	case "ultra": t.ZScoreExtremo = 4.0; t.Persistencia = 3; t.UmbralThreat = 40.0
+	case "instant": t.ZScoreExtremo = 2.5; t.Persistencia = 1; t.UmbralThreat = 20.0
+	}
+	return t
+}
+
+func (p *PerfilInboundGlobal) GetGlobalSummary() GlobalSummary {
+	var summary GlobalSummary
+	for i := 0; i < p.numShards; i++ {
+		shard := p.shards[i]
+		shard.mu.Lock()
+		summary.ActiveTargets += len(shard.realtimePPS)
+		for ip, pps := range shard.realtimePPS {
+			resPPS := pps.Resumen()
+			resMbps := shard.realtimeMbps[ip].Resumen()
+			summary.TotalCurrentPPS += resPPS.Actual
+			summary.TotalCurrentMbps += resMbps.Actual
+			summary.TotalSamples += resPPS.Muestras
+		}
+		shard.mu.Unlock()
+	}
+	return summary
+}
+
+func (p *PerfilInboundGlobal) SnapshotPerfiles() []PerfilGlobalIP {
+	var allIPs []string
+	for i := 0; i < p.numShards; i++ {
+		shard := p.shards[i]
+		shard.mu.Lock()
+		for ip := range shard.realtimePPS {
+			allIPs = append(allIPs, ip)
+		}
+		shard.mu.Unlock()
+	}
+	sort.Strings(allIPs)
+
+	resultados := make([]PerfilGlobalIP, 0, len(allIPs))
+	for _, ip := range allIPs {
+		shard := p.getShard(ip)
+		shard.mu.Lock()
+		resPPS := shard.realtimePPS[ip].Resumen()
+		resMbps := shard.realtimeMbps[ip].Resumen()
+		puntaje := int(shard.puntajes[ip])
+		shard.mu.Unlock()
+
+		var topProtos []string
+		if p.profiler != nil {
+			if pers := p.profiler.GetProfile(ip); pers != nil {
+				pers.RLock()
+				topProtos = p.getTopProtosInternal(pers.PuertosFrecuentes)
+				pers.RUnlock()
+			}
+		}
+		resultados = append(resultados, PerfilGlobalIP{
+			IP: ip, CurrentMbps: resMbps.Actual, PromedioMbps: resMbps.Media, DesvioMbps: resMbps.Desvio,
+			CurrentPPS: resPPS.Actual, PromedioPPS: resPPS.Media, DesvioPPS: resPPS.Desvio,
+			PuntajeAmenaza: puntaje, Muestras: resPPS.Muestras, UltimaMuestra: time.Now(), ProtocolosTop: topProtos,
+		})
+	}
+	return resultados
+}
+
+func (p *PerfilInboundGlobal) getTopProtosInternal(puertos map[uint16]uint64) []string {
+	if len(puertos) == 0 { return nil }
+	type item struct { p uint16; c uint64 }
+	items := make([]item, 0, len(puertos))
+	for port, count := range puertos { items = append(items, item{p: port, c: count}) }
+	sort.Slice(items, func(i, j int) bool { return items[i].c > items[j].c })
+	if len(items) > MaxProtocolosTop { items = items[:MaxProtocolosTop] }
+	res := make([]string, 0, len(items))
+	for _, it := range items { res = append(res, fmt.Sprintf("%d", it.p)) }
+	return res
+}
+
+func (p *PerfilInboundGlobal) esDestinoPropio(dstIP string) bool {
+	ip := net.ParseIP(dstIP)
+	if ip == nil { return false }
+	for _, network := range p.ownedNets {
+		if network.Contains(ip) { return true }
+	}
+	return false
+}
+
+
+================================================================================
+FILE: analyzer/integration_test.go
+================================================================================
+package analyzer
+
+import (
+	"dolly-sensor/config"
+	"dolly-sensor/mitigation"
+	"dolly-sensor/packet"
+	"net"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+func TestFullMitigationPipeline(t *testing.T) {
+	// 1. Configuración del Entorno
+	cfg := config.Default()
+	cfg.BGP.Enabled = true
+	ownedNets := []*net.IPNet{{IP: net.ParseIP("10.0.0.0"), Mask: net.CIDRMask(24, 32)}}
+	
+	// Mock de BGP para capturar comandos
+	var mu sync.Mutex
+	capturedCommands := []string{}
+	bgp := mitigation.NewBGPManager(cfg.BGP)
+	bgp.Executor = func(args []string) error {
+		mu.Lock()
+		capturedCommands = append(capturedCommands, strings.Join(args, " "))
+		mu.Unlock()
+		return nil
+	}
+
+	blocklist := mitigation.NewBlocklistEngine()
+	analyzer := NuevoPerfilInboundGlobal(ownedNets, blocklist, bgp, cfg, nil)
+
+	// 2. Simular Ataque FTP (Flood desde IP atacante)
+	attackerIP := "192.168.1.100"
+	victimIP := "10.0.0.5"
+	
+	// Necesitamos que el Z-Score llegue a > 1000. 
+	// Si enviamos 1500 unidades por segundo (SamplingRate=1500)
+	ahora := time.Now()
+	for i := 0; i < 10; i++ {
+		pkt := &packet.Event{
+			SrcIP: attackerIP,
+			DstIP: victimIP,
+			SrcPort: 22222, 
+			DstPort: 21,
+			Transport: "TCP",
+			FrameLength: 64,
+			SamplingRate: 1500, 
+			Timestamp: ahora.Add(time.Duration(i) * 1100 * time.Millisecond),
+		}
+		
+		res := analyzer.Evaluar(pkt, cfg)
+		if res.Alerta {
+			t.Logf("Alerta disparada en iteración %d: %s", i, res.NombreAlerta)
+		}
+	}
+
+	// Dar tiempo a la goroutine de BGP
+	time.Sleep(100 * time.Millisecond)
+
+	// 3. Verificación
+	mu.Lock()
+	defer mu.Unlock()
+	
+	foundFlowspec := false
+	for _, cmd := range capturedCommands {
+		if strings.Contains(cmd, "ipv4-flowspec") && strings.Contains(cmd, "rate-limit 250") {
+			foundFlowspec = true
+			break
+		}
+	}
+
+	if !foundFlowspec {
+		t.Errorf("El pipeline no generó el comando Flowspec esperado. Comandos capturados: %v", capturedCommands)
+	}
+}
+
+
+================================================================================
+FILE: analyzer/pipeline.go
+================================================================================
+package analyzer
+
+import (
+	"dolly-sensor/basefilters"
+	"dolly-sensor/config"
+	"dolly-sensor/packet"
+	"fmt"
+	"log"
+	"time"
+)
+
+// ExecutePipeline orquesta la cadena de filtros en el orden solicitado
+func (p *PerfilInboundGlobal) ExecutePipeline(pkt *packet.Event, cfg config.Config) (alert bool, name, reason string) {
+	srcIP := pkt.SrcIP
+	dstIP := pkt.DstIP
+
+	// 0. Obtener Trust Score para uso en filtros
+	if p.profiler != nil && srcIP != "" {
+		if pers := p.profiler.GetProfile(dstIP); pers != nil {
+			pers.RLock()
+			if trust, ok := pers.ReputacionOrigenes[srcIP]; ok {
+				pkt.SourceTrustScore = trust.TrustScore
+			}
+			pers.RUnlock()
+		}
+	}
+
+	// 1. Blocklist Global (Bloqueo explícito rápido)
+	if p.blocklist != nil && srcIP != "" {
+		if p.blocklist.IsBlocked(srcIP) {
+			return true, "🚫 BLOCKLIST-HIT", fmt.Sprintf("Source IP %s matches global blocklist", srcIP)
+		}
+	}
+
+	// 2. TRUSTSCORE / REPUTACIÓN (Detección por comportamiento histórico, e.g. SYN Flood)
+	// Se ejecuta ANTES que stateful para proteger el motor de estado de flooders conocidos
+	if p.ValidateTCPFlood != nil && srcIP != "" && p.profiler != nil {
+		if pers := p.profiler.GetProfile(dstIP); pers != nil {
+			pers.RLock()
+			trust, hasTrust := pers.ReputacionOrigenes[srcIP]
+			var alertFound bool
+			var m packet.Mitigation
+			
+			if hasTrust {
+				res := p.ValidateTCPFlood(pkt, trust.SYNCount, trust.ACKCount)
+				if res.Alert {
+					alertFound = true
+					m = packet.Mitigation{
+						Alert:    true,
+						Block:    true,
+						Drop:     true,
+						SourceIP: srcIP,
+						Name:     res.Name,
+						Reason:   res.Reason,
+					}
+				}
+			}
+			pers.RUnlock()
+
+			if alertFound {
+				p.ExecuteMitigation(m)
+				return true, m.Name, m.Reason
+			}
+		}
+	}
+
+	// 3. STATEFUL TCP VALIDATION (Protocol correctness, e.g. Out-of-state)
+	if p.ValidateTCP != nil {
+		check := p.ValidateTCP(pkt)
+		if check.Alert {
+			// Evitar que el sensor se bloquee a sí mismo si detecta paquetes out-of-state saliendo de nuestra red
+			if check.Name == "🛡️ INVALID-TCP-STATE" && p.esDestinoPropio(pkt.SrcIP) {
+				return false, "", ""
+			}
+
+			m := packet.Mitigation{
+				Alert:    true,
+				Block:    true,
+				SourceIP: srcIP,
+				Name:     check.Name,
+				Reason:   check.Reason,
+			}
+			p.ExecuteMitigation(m)
+			return true, check.Name, check.Reason
+		}
+	}
+
+	// 4. PROTOCOL BASE FILTERS (Aplicación: FTP, SSH, etc.)
+	if m := basefilters.Evaluate(pkt, cfg); m.Alert {
+		if m.Block {
+			p.ExecuteMitigation(m)
+		}
+		return true, m.Name, m.Reason
+	}
+
+	return false, "", ""
+}
+
+// ExecuteMitigation es el encargado de disparar la acción técnica real (BGP Flowspec)
+func (p *PerfilInboundGlobal) ExecuteMitigation(m packet.Mitigation) {
+	if !m.Block || m.SourceIP == "" {
+		return
+	}
+
+	triggerID := m.Name + "-" + m.SourceIP
+	// Evitar duplicidad de mitigaciones en corto tiempo
+	if !p.blocklist.MarkTriggered(triggerID) {
+		return
+	}
+
+	log.Printf("[PIPELINE] Mitigating: %s for Source %s. Reason: %s", m.Name, m.SourceIP, m.Reason)
+
+	if p.bgp != nil {
+		go func() {
+			// Ahora enviamos la receta completa 'm' para un bloqueo granular
+			err := p.bgp.AnnounceFlowspec(m)
+			if err != nil {
+				log.Printf("[BGP] Error in flowspec announcement: %v", err)
+			}
+			
+			// Si tiene duración, después de que pase, limpiamos el triggered para que pueda re-activarse si el ataque sigue
+			if m.Duration > 0 {
+				time.Sleep(time.Duration(m.Duration) * time.Second)
+				p.blocklist.ClearTriggered(triggerID)
+			}
+		}()
+	}
+}
+
+
+================================================================================
+FILE: analyzer/zscore.go
+================================================================================
+package analyzer
+
+import (
+	"math"
+	"sync"
+	"time"
+)
+
+type ResultadoZScore struct {
+	Actual   float64
+	Media    float64
+	Desvio   float64
+	Muestras int
+}
+
+type PerfilZScore struct {
+	mu               sync.Mutex
+	inicioVentana    time.Time
+	acumuladoVentana float64
+	media            float64
+	m2               float64
+	cantidad         int
+	ultimaMuestra    time.Time
+}
+
+const alphaAdaptacion = 0.1
+
+func NuevoPerfilZScore() *PerfilZScore {
+	return &PerfilZScore{}
+}
+
+func (p *PerfilZScore) ObservarConPeso(ahora time.Time, peso float64) ResultadoZScore {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.inicioVentana.IsZero() {
+		p.inicioVentana = ahora
+	}
+	p.acumuladoVentana += peso
+
+	transcurrido := ahora.Sub(p.inicioVentana).Seconds()
+	if transcurrido >= 1.0 {
+		tasa := p.acumuladoVentana / transcurrido
+		p.actualizarEstadisticas(tasa, ahora)
+		p.inicioVentana = ahora
+		p.acumuladoVentana = 0
+		return p.resultadoInterno(tasa)
+	}
+
+	return p.resultadoInterno(0)
+}
+
+func (p *PerfilZScore) Resumen() ResultadoZScore {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	tasa := 0.0
+	if !p.inicioVentana.IsZero() {
+		if dur := time.Since(p.inicioVentana).Seconds(); dur > 0 {
+			tasa = p.acumuladoVentana / dur
+		}
+	}
+	return p.resultadoInterno(tasa)
+}
+
+func (p *PerfilZScore) resultadoInterno(actual float64) ResultadoZScore {
+	varianza := 0.0
+	if p.cantidad > 1 {
+		varianza = p.m2 / float64(p.cantidad-1)
+	}
+	desvio := math.Sqrt(varianza)
+	return ResultadoZScore{
+		Actual: actual, Media: p.media, Desvio: desvio, Muestras: p.cantidad,
+	}
+}
+
+func (p *PerfilZScore) actualizarEstadisticas(valor float64, momento time.Time) {
+	p.cantidad++
+	if p.cantidad == 1 {
+		p.media = valor
+		p.m2 = 0
+	} else {
+		// Usamos un factor de olvido para que el baseline no sea infinito
+		// pero mantenemos el cálculo de varianza
+		diff := valor - p.media
+		p.media += alphaAdaptacion * diff
+		p.m2 = (1-alphaAdaptacion)*p.m2 + alphaAdaptacion*diff*(valor-p.media)
+	}
+	p.ultimaMuestra = momento
+}
+
+
+================================================================================
+FILE: analyzer/zscore_test.go
+================================================================================
+package analyzer
+
+import (
+	"testing"
+	"time"
+)
+
+func TestZScoreMath(t *testing.T) {
+	p := NuevoPerfilZScore()
+	ahora := time.Now()
+
+	// Simular muestras cada 2 segundos para asegurar que la ventana se limpie
+	for i := 1; i <= 5; i++ {
+		_ = p.ObservarConPeso(ahora.Add(time.Duration(i*2)*time.Second), 2000)
+	}
+	
+	res := p.Resumen()
+	if res.Media < 500 {
+		t.Errorf("La media debería estar convergiendo, actual: %f", res.Media)
+	}
+
+	// Un pico claro: enviamos 100000 unidades en 2 segundos = 50000 PPS
+	pico := p.ObservarConPeso(ahora.Add(12*time.Second), 100000)
+	
+	if pico.Actual < 45000 {
+		t.Errorf("El valor actual debería estar cerca de 50000, obtenido: %f", pico.Actual)
+	}
+	
+	if pico.Desvio == 0 {
+		t.Error("El desvío estándar debería ser mayor a 0 tras un pico")
+	}
+}
+
+
+================================================================================
+FILE: app/run.go
+================================================================================
+package app
+import (
+	"context"
+	"dolly-sensor/analyzer"
+	"dolly-sensor/config"
+	"dolly-sensor/dashboard"
+	"dolly-sensor/mitigation"
+	"dolly-sensor/packet"
+	"dolly-sensor/profiler"
+	"dolly-sensor/sflow"
+	"dolly-sensor/store"
+	"fmt"
+	"log"
+	"net"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+)
+
+func Run() error {
+	cfg, err := config.Load("config.json")
+	if err != nil {
+		log.Printf("[CORE] error loading config.json, using defaults: %v", err)
+		cfg = config.Default()
+	}
+
+	if err := cfg.Validate(); err != nil {
+		return fmt.Errorf("config validation failed: %v", err)
+	}
+
+	ownedNets := parseOwnedNets(cfg.Local.OwnedCIDRs)
+	packetStore := store.New(
+		cfg.Store.MaxRecentPackets,
+		ownedNets,
+		cfg.Performance.Shards,
+		time.Duration(cfg.Performance.StatsTTL)*time.Second,
+		time.Duration(cfg.Performance.CleanupInterval)*time.Second,
+	)
+
+	// Cargar mapeos de protocolos
+	if err := packet.LoadProtocols("protocols.json"); err != nil {
+		log.Printf("[CORE] warning: could not load protocols.json: %v", err)
+	}
+
+	// Inicializar Mitigación
+	blocklist := mitigation.NewBlocklistEngine()
+	if err := blocklist.LoadFromPath(cfg.Mitigation.BlocklistPath); err != nil {
+		log.Printf("[CORE] warning: could not load blocklist: %v", err)
+	}
+	bgp := mitigation.NewBGPManager(cfg.BGP)
+
+	// Iniciar el profiler para snapshots y persistencia
+	prof := profiler.NewProfiler(packetStore, cfg, time.Duration(cfg.Performance.ProfilerInterval)*time.Second)
+	prof.Start()
+
+	perfilInbound := analyzer.NuevoPerfilInboundGlobal(ownedNets, blocklist, bgp, cfg, prof)
+	perfilInbound.HasConn = packetStore.HasActiveConnection
+	perfilInbound.ValidateTCP = packetStore.ValidateTCP
+	perfilInbound.ValidateTCPFlood = packetStore.ValidateTCPFlood
+	processor := sflow.NewProcessor(packetStore, perfilInbound, ownedNets, cfg.SFlow.Sampling, cfg)
+
+	if cfg.Alert.DiscordWebhookURL != "" {
+		go startAlertSubscriber(packetStore, cfg.Alert.DiscordWebhookURL)
+	}
+
+	dashConfig := dashboard.RuntimeConfig{
+		CollectorAddr:   cfg.CollectorAddr(),
+		FrontendAddr:    cfg.HTTP.Listen,
+		ObtenerPerfiles: perfilInbound.SnapshotPerfiles,
+		ObtenerResumen:  perfilInbound.GetGlobalSummary,
+		ObtenerDetalleIP: prof.GetProfile,
+		SetManualTrust:  prof.SetManualTrust,
+		GetAllReputations: prof.GetAllReputations,
+		MitigationStatus: func() map[string]interface{} {
+			return map[string]interface{}{
+				"bgp_enabled":       cfg.BGP.Enabled,
+				"blocklist_entries": blocklist.Count(),
+				"announcements":     bgp.GetAnnouncements(),
+			}
+		},
+		ReloadBlocklists: func() error {
+			return blocklist.LoadFromPath(cfg.Mitigation.BlocklistPath)
+		},
+		GetBlocklistFiles: func() []string {
+			return blocklist.GetFiles()
+		},
+		AddBlocklistEntry: func(entry string) error {
+			return blocklist.AddManualBlock(entry)
+		},
+	}
+
+	// Servidor Web / Dashboard
+	go func() {
+		log.Printf("[HTTP] dashboard listening on %s", cfg.HTTP.Listen)
+		if err := dashboard.Run(cfg.HTTP.Listen, "web", packetStore, dashConfig); err != nil {
+			log.Printf("[HTTP] error: %v", err)
+		}
+	}()
+
+	log.Printf("[CORE] starting dolly-sensor (sampling=1:%d, max_packets=%d)",
+		cfg.SFlow.Sampling, cfg.Store.MaxRecentPackets)
+
+	// Capturar señales de terminación para cierre ordenado
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		if err := sflow.Listen(cfg.CollectorAddr(), processor); err != nil {
+			log.Printf("[SFLOW] collector error: %v", err)
+			stop()
+		}
+	}()
+
+	<-ctx.Done()
+	log.Printf("[CORE] shutting down...")
+	return nil
+}
+
+func parseOwnedNets(cidrs []string) []*net.IPNet {
+	nets := make([]*net.IPNet, 0)
+	for _, cidr := range cidrs {
+		_, network, err := net.ParseCIDR(cidr)
+		if err != nil {
+			log.Printf("[CORE] warning: invalid CIDR %s: %v", cidr, err)
+			continue
+		}
+		nets = append(nets, network)
+	}
+	return nets
+}
+
+func startAlertSubscriber(packetStore *store.Store, webhookURL string) {
+	ch := packetStore.Subscribe()
+	defer packetStore.Unsubscribe(ch)
+
+	log.Printf("[ALERTS] subscriber started (webhook enabled)")
+	for pkt := range ch {
+		if pkt.Alert {
+			log.Printf("[ALERT] %s on %s: %s", pkt.AlertName, pkt.DstIP, pkt.AlertReason)
+			// Aquí se implementaría el envío real al webhook de Discord
+		}
+	}
+}
+
+
+================================================================================
+FILE: basefilters/base.go
+================================================================================
+package basefilters
+
+import (
+	"dolly-sensor/config"
+	"dolly-sensor/packet"
+)
+
+type BaseFilter interface {
+	Name() string
+	Protocol() string 
+	Process(pkt *packet.Event, cfg config.Config) packet.Mitigation
+}
+
+var registry = []BaseFilter{}
+
+func Register(f BaseFilter) {
+	registry = append(registry, f)
+}
+
+func GetAll() []BaseFilter {
+	return registry
+}
+
+func Evaluate(pkt *packet.Event, cfg config.Config) packet.Mitigation {
+	for _, f := range registry {
+		if pkt.Protocol == f.Protocol() || f.Protocol() == "*" {
+			if m := f.Process(pkt, cfg); m.Alert {
+				return m
+			}
+		}
+	}
+	return packet.Mitigation{}
+}
+
+
+================================================================================
+FILE: basefilters/ftp.go
+================================================================================
+package basefilters
+
+import (
+	"dolly-sensor/config"
+	"dolly-sensor/packet"
+	"fmt"
+)
+
+// FTPFilter maneja específicamente el canal de CONTROL (Puerto 21)
+type FTPFilter struct{}
+
+func init() {
+	Register(&FTPFilter{})
+}
+
+func (f *FTPFilter) Name() string { return "FTP-CONTROL-BASE" }
+func (f *FTPFilter) Protocol() string { return "*" }
+
+func (f *FTPFilter) Process(pkt *packet.Event, cfg config.Config) packet.Mitigation {
+	// Solo puerto 21
+	if pkt.DstPort != 21 && pkt.SrcPort != 21 {
+		return packet.Mitigation{}
+	}
+
+	// 0. Excepción por Trust Score
+	if pkt.SourceTrustScore >= cfg.Trust.MinScoreForExemption {
+		return packet.Mitigation{}
+	}
+
+	// 1. Mismatch de Protocolo
+	if pkt.Transport != "TCP" {
+		return packet.Mitigation{
+			Alert:    true,
+			Block:    true,
+			Drop:     true,
+			SourceIP: pkt.SrcIP,
+			DestIP:   pkt.DstIP,
+			Protocol: pkt.Transport,
+			DestPort: 21,
+			Duration: cfg.Protocols.FTP.BlockDuration,
+			Name:     "🛡️ FTP-CTRL-NON-TCP",
+			Reason:   fmt.Sprintf("Non-TCP traffic (%s) to FTP control port from %s", pkt.Transport, pkt.SrcIP),
+		}
+	}
+
+	// 2. Puertos Privilegiados
+	if pkt.SrcPort < 1024 {
+		return packet.Mitigation{
+			Alert:    true,
+			Block:    true,
+			Drop:     true,
+			SourceIP: pkt.SrcIP,
+			DestIP:   pkt.DstIP,
+			Duration: cfg.Protocols.FTP.BlockDuration,
+			Name:     "🛡️ FTP-CTRL-PRIVILEGED-PORT",
+			Reason:   fmt.Sprintf("Source IP %s using privileged port %d for FTP Control", pkt.SrcIP, pkt.SrcPort),
+		}
+	}
+
+	// 3. Ratelimit
+	if pkt.SourcePPS > cfg.Protocols.FTP.MaxPPS {
+		return packet.Mitigation{
+			Alert:     true,
+			Block:     true,
+			SourceIP:  pkt.SrcIP,
+			DestIP:    pkt.DstIP,
+			Protocol:  "TCP",
+			DestPort:  21,
+			RateLimit: cfg.Protocols.FTP.RateLimitPPS,
+			Duration:  cfg.Protocols.FTP.BlockDuration,
+			Name:      "🛡️ FTP-CTRL-RATELIMIT",
+			Reason:    fmt.Sprintf("FTP Control Flood: %.0f pps from %s", pkt.SourcePPS, pkt.SrcIP),
+		}
+	}
+
+	// 4. Comandos Malformados (Solo en puerto 21)
+	if pkt.PayloadHex != "" && pkt.InEstablishedSession {
+		if len(pkt.PayloadHex) > 1024 { 
+			return packet.Mitigation{
+				Alert:         true,
+				Block:         true,
+				SourceIP:      pkt.SrcIP,
+				DestPort:      21,
+				PacketLenMin:  512,
+				Name:          "🛡️ FTP-CTRL-MALFORMED",
+				Reason:        "FTP command exceeds maximum length",
+			}
+		}
+	}
+	
+	return packet.Mitigation{}
+}
+
+
+================================================================================
+FILE: basefilters/ftp_data.go
+================================================================================
+package basefilters
+
+import (
+	"dolly-sensor/config"
+	"dolly-sensor/packet"
+	"fmt"
+)
+
+// FTPDataFilter maneja específicamente el canal de DATOS (Puerto 20)
+type FTPDataFilter struct{}
+
+func init() {
+	Register(&FTPDataFilter{})
+}
+
+func (f *FTPDataFilter) Name() string { return "FTP-DATA-BASE" }
+func (f *FTPDataFilter) Protocol() string { return "*" }
+
+func (f *FTPDataFilter) Process(pkt *packet.Event, cfg config.Config) packet.Mitigation {
+	// Solo puerto 20
+	if pkt.DstPort != 20 && pkt.SrcPort != 20 {
+		return packet.Mitigation{}
+	}
+
+	// 0. Excepción por Trust Score
+	if pkt.SourceTrustScore >= cfg.Trust.MinScoreForExemption {
+		return packet.Mitigation{}
+	}
+
+	// 1. Mismatch de Protocolo
+	if pkt.Transport != "TCP" {
+		return packet.Mitigation{
+			Alert:    true,
+			Block:    true,
+			Drop:     true,
+			SourceIP: pkt.SrcIP,
+			DestIP:   pkt.DstIP,
+			Protocol: pkt.Transport,
+			DestPort: 20,
+			Duration: cfg.Protocols.FTPData.BlockDuration,
+			Name:     "🛡️ FTP-DATA-NON-TCP",
+			Reason:   fmt.Sprintf("Non-TCP traffic (%s) to FTP data port from %s", pkt.Transport, pkt.SrcIP),
+		}
+	}
+
+	// 2. Puertos Privilegiados
+	if pkt.SrcPort < 1024 {
+		return packet.Mitigation{
+			Alert:    true,
+			Block:    true,
+			Drop:     true,
+			SourceIP: pkt.SrcIP,
+			DestIP:   pkt.DstIP,
+			Duration: cfg.Protocols.FTPData.BlockDuration,
+			Name:     "🛡️ FTP-DATA-PRIVILEGED-PORT",
+			Reason:   fmt.Sprintf("Source IP %s using privileged port %d for FTP Data", pkt.SrcIP, pkt.SrcPort),
+		}
+	}
+
+	// 3. Ratelimit (Usando umbrales de FTP-Data, que suelen ser más altos)
+	if pkt.SourcePPS > cfg.Protocols.FTPData.MaxPPS {
+		return packet.Mitigation{
+			Alert:     true,
+			Block:     true,
+			SourceIP:  pkt.SrcIP,
+			DestIP:    pkt.DstIP,
+			Protocol:  "TCP",
+			DestPort:  20,
+			RateLimit: cfg.Protocols.FTPData.RateLimitPPS,
+			Duration:  cfg.Protocols.FTPData.BlockDuration,
+			Name:      "🛡️ FTP-DATA-RATELIMIT",
+			Reason:    fmt.Sprintf("FTP Data Flood: %.0f pps from %s (Limit: %.0f)", pkt.SourcePPS, pkt.SrcIP, cfg.Protocols.FTPData.MaxPPS),
+		}
+	}
+
+	return packet.Mitigation{}
+}
+
+
+================================================================================
+FILE: blocklists/.gitkeep
+================================================================================
+
+
+================================================================================
+FILE: blocklists/test.list
+================================================================================
+8.8.8.8
+
+
+================================================================================
+FILE: config/config.go
+================================================================================
+package config
+
+import (
+	"encoding/json"
+	"fmt"
+	"net"
+	"os"
+)
+
+const DefaultPath = "config.json"
+
+type Config struct {
+	SFlow      SFlowConfig      `json:"sflow"`
+	HTTP       HTTPConfig       `json:"http"`
+	Store      StoreConfig      `json:"store"`
+	Local      LocalConfig      `json:"local"`
+	Alert      AlertConfig      `json:"alert"`
+	Detection  DetectionConfig  `json:"detection"`
+	BGP        BGPConfig        `json:"bgp"`
+	Mitigation MitigationConfig `json:"mitigation"`
+	Protocols  ProtocolConfig   `json:"protocols_tuning"`
+	Trust      TrustConfig      `json:"trust_tuning"`
+	Performance PerformanceConfig `json:"performance"`
+}
+
+type PerformanceConfig struct {
+	Shards            int `json:"shards"`              // Número de particiones (64 por defecto)
+	CleanupInterval   int `json:"cleanup_interval"`    // Segundos entre limpiezas de memoria
+	StatsTTL          int `json:"stats_ttl"`           // Cuánto tiempo recordar una IP inactiva (segundos)
+	ProfilerInterval  int `json:"profiler_interval"`   // Segundos entre snapshots del profiler
+}
+
+type ProtocolConfig struct {
+	FTP struct {
+		MaxPPS        float64 `json:"max_pps"`
+		RateLimitPPS  uint32  `json:"ratelimit_pps"`
+		BlockDuration int     `json:"block_duration"`
+	} `json:"ftp"`
+	FTPData struct {
+		MaxPPS        float64 `json:"max_pps"`
+		RateLimitPPS  uint32  `json:"ratelimit_pps"`
+		BlockDuration int     `json:"block_duration"`
+	} `json:"ftp_data"`
+}
+
+type TrustConfig struct {
+	MinScoreForExemption int `json:"min_score_for_exemption"`
+}
+
+type BGPConfig struct {
+	Enabled   bool   `json:"enabled"`
+	LocalAS   uint32 `json:"local_as"`
+	PeerIP    string `json:"peer_ip"`
+	PeerAS    uint32 `json:"peer_as"`
+	Community string `json:"community"` // ej: "65000:666" (RTBH)
+	NextHop   string `json:"next_hop"`
+}
+
+type MitigationConfig struct {
+	BlocklistPath string `json:"blocklist_path"`
+	AutoBlock     bool   `json:"auto_block"`
+}
+
+type SFlowConfig struct {
+	Sampling  int             `json:"sampling"`
+	Polling   int             `json:"polling"`
+	Collector CollectorConfig `json:"collector"`
+}
+
+type CollectorConfig struct {
+	IP      string `json:"ip"`
+	UDPPort int    `json:"udpport"`
+}
+
+type HTTPConfig struct {
+	Listen string `json:"listen"`
+}
+
+type StoreConfig struct {
+	MaxRecentPackets int `json:"max_recent_packets"`
+}
+
+type LocalConfig struct {
+	OwnedCIDRs []string `json:"owned_cidrs"`
+	TrustedIPs []string `json:"trusted_ips"`
+}
+
+type AlertConfig struct {
+	DiscordWebhookURL string `json:"discord_webhook_url"`
+}
+
+type DetectionConfig struct {
+	Sensitivity string `json:"sensitivity"` // relaxed, balanced, aggressive, ultra, instant
+	NetworkType string `json:"network_type"` // home, office, datacenter
+}
+
+func Default() Config {
+	return Config{
+		SFlow: SFlowConfig{Sampling: 1, Polling: 30, Collector: CollectorConfig{IP: "127.0.0.1", UDPPort: 6343}},
+		HTTP:  HTTPConfig{Listen: "127.0.0.1:8080"},
+		Store: StoreConfig{MaxRecentPackets: 100000},
+		Local: LocalConfig{OwnedCIDRs: []string{"127.0.0.0/8", "192.168.1.0/24"}},
+		Alert: AlertConfig{DiscordWebhookURL: ""},
+		Detection: DetectionConfig{
+			Sensitivity: "balanced",
+			NetworkType: "home",
+		},
+		BGP: BGPConfig{
+			Enabled:   false,
+			LocalAS:   65000,
+			Community: "65000:666",
+		},
+		Mitigation: MitigationConfig{
+			BlocklistPath: "blocklists/",
+			AutoBlock:     true,
+		},
+		Protocols: ProtocolConfig{
+			FTP: struct {
+				MaxPPS        float64 `json:"max_pps"`
+				RateLimitPPS  uint32  `json:"ratelimit_pps"`
+				BlockDuration int     `json:"block_duration"`
+			}{MaxPPS: 1000, RateLimitPPS: 250, BlockDuration: 60},
+			FTPData: struct {
+				MaxPPS        float64 `json:"max_pps"`
+				RateLimitPPS  uint32  `json:"ratelimit_pps"`
+				BlockDuration int     `json:"block_duration"`
+			}{MaxPPS: 5000, RateLimitPPS: 1000, BlockDuration: 60},
+		},
+		Trust: TrustConfig{
+			MinScoreForExemption: 60,
+		},
+		Performance: PerformanceConfig{
+			Shards:           64,
+			CleanupInterval:  60,
+			StatsTTL:         300,
+			ProfilerInterval: 30,
+		},
+	}
+}
+
+func Load(path string) (Config, error) {
+	cfg := Default()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return Config{}, fmt.Errorf("read %s: %w", path, err)
+	}
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return Config{}, fmt.Errorf("parse %s: %w", path, err)
+	}
+	cfg.applyDefaults()
+	return cfg, nil
+}
+
+func (c Config) CollectorAddr() string {
+	return fmt.Sprintf("%s:%d", c.SFlow.Collector.IP, c.SFlow.Collector.UDPPort)
+}
+
+func (c *Config) applyDefaults() {
+	def := Default()
+	if c.SFlow.Sampling <= 0 { c.SFlow.Sampling = def.SFlow.Sampling }
+	if c.SFlow.Collector.IP == "" { c.SFlow.Collector.IP = def.SFlow.Collector.IP }
+	if c.SFlow.Collector.UDPPort <= 0 { c.SFlow.Collector.UDPPort = def.SFlow.Collector.UDPPort }
+	if c.HTTP.Listen == "" { c.HTTP.Listen = def.HTTP.Listen }
+	if c.Store.MaxRecentPackets <= 0 { c.Store.MaxRecentPackets = def.Store.MaxRecentPackets }
+	if len(c.Local.OwnedCIDRs) == 0 {
+		c.Local.OwnedCIDRs = append([]string(nil), def.Local.OwnedCIDRs...)
+	}
+	if c.Detection.Sensitivity == "" { c.Detection.Sensitivity = "balanced" }
+	if c.Detection.NetworkType == "" { c.Detection.NetworkType = "home" }
+	
+	if c.Protocols.FTP.MaxPPS <= 0 { c.Protocols.FTP.MaxPPS = def.Protocols.FTP.MaxPPS }
+	if c.Protocols.FTP.RateLimitPPS == 0 { c.Protocols.FTP.RateLimitPPS = def.Protocols.FTP.RateLimitPPS }
+	if c.Protocols.FTP.BlockDuration == 0 { c.Protocols.FTP.BlockDuration = def.Protocols.FTP.BlockDuration }
+
+	if c.Protocols.FTPData.MaxPPS <= 0 { c.Protocols.FTPData.MaxPPS = def.Protocols.FTPData.MaxPPS }
+	if c.Protocols.FTPData.RateLimitPPS == 0 { c.Protocols.FTPData.RateLimitPPS = def.Protocols.FTPData.RateLimitPPS }
+	if c.Protocols.FTPData.BlockDuration == 0 { c.Protocols.FTPData.BlockDuration = def.Protocols.FTPData.BlockDuration }
+
+	if c.Trust.MinScoreForExemption == 0 { c.Trust.MinScoreForExemption = def.Trust.MinScoreForExemption }
+
+	if c.Performance.Shards <= 0 { c.Performance.Shards = def.Performance.Shards }
+	if c.Performance.CleanupInterval <= 0 { c.Performance.CleanupInterval = def.Performance.CleanupInterval }
+	if c.Performance.StatsTTL <= 0 { c.Performance.StatsTTL = def.Performance.StatsTTL }
+	if c.Performance.ProfilerInterval <= 0 { c.Performance.ProfilerInterval = def.Performance.ProfilerInterval }
+}
+
+func (c *Config) Validate() error {
+	if c.SFlow.Collector.UDPPort == 0 {
+		return fmt.Errorf("sflow collector udp port cannot be 0")
+	}
+	if len(c.Local.OwnedCIDRs) == 0 {
+		return fmt.Errorf("no owned CIDRs defined")
+	}
+	for _, cidr := range c.Local.OwnedCIDRs {
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			return fmt.Errorf("invalid CIDR %s: %v", cidr, err)
+		}
+	}
+	if c.HTTP.Listen == "" {
+		return fmt.Errorf("HTTP listen address cannot be empty")
+	}
+	return nil
+}
+
+func (c Config) OwnedNetworks() ([]*net.IPNet, error) {
+	out := make([]*net.IPNet, 0, len(c.Local.OwnedCIDRs))
+	for _, cidr := range c.Local.OwnedCIDRs {
+		_, network, err := net.ParseCIDR(cidr)
+		if err != nil {
+			return nil, fmt.Errorf("parse local owned cidr %q: %w", cidr, err)
+		}
+		out = append(out, network)
+	}
+	return out, nil
+}
+
+
+================================================================================
+FILE: config.json
+================================================================================
+{
+  "sflow": {
+    "sampling": 1,
+    "polling": 30,
+    "collector": {
+      "ip": "0.0.0.0",
+      "udpport": 6343
+    }
+  },
+  "http": {
+    "listen": "127.0.0.1:8080"
+  },
+  "store": {
+    "max_recent_packets": 20000
+  },
+  "performance": {
+    "shards": 16,
+    "cleanup_interval": 60,
+    "stats_ttl": 300,
+    "profiler_interval": 30
+  },
+  "local": {
+    "owned_cidrs": ["127.0.0.0/8", "192.168.0.0/24"],
+    "trusted_ips": ["1.1.1.1", "192.168.0.1"]
+  },
+  "alert": {
+    "discord_webhook_url": ""
+  },
+  "detection": {
+    "sensitivity": "balanced",
+    "network_type": "home"
+  },
+  "bgp": {
+    "enabled": false,
+    "local_as": 65000,
+    "peer_ip": "192.168.0.1",
+    "peer_as": 65001,
+    "community": "65000:666",
+    "next_hop": "192.168.0.103"
+  },
+  "mitigation": {
+    "blocklist_path": "blocklists/",
+    "auto_block": false
+  },
+  "protocols_tuning": {
+    "ftp": {
+      "max_pps": 1000,
+      "ratelimit_pps": 250,
+      "block_duration": 60
+    },
+    "ftp_data": {
+      "max_pps": 5000,
+      "ratelimit_pps": 1000,
+      "block_duration": 60
+    }
+  },
+  "trust_tuning": {
+    "min_score_for_exemption": 60
+  }
+}
+
+
+================================================================================
+FILE: main.go
+================================================================================
+package main
+
+import (
+	"dolly-sensor/app"
+	"log"
+)
+
+func main() {
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+
+	if err := app.Run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+
+================================================================================
+FILE: mitigation/bgp.go
+================================================================================
+package mitigation
+
+import (
+	"dolly-sensor/config"
+	"dolly-sensor/packet"
+	"fmt"
+	"log"
+	"os/exec"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+type BGPAnnouncement struct {
+	ID        string    `json:"id"`
+	Prefix    string    `json:"prefix"`
+	Type      string    `json:"type"` // "RTBH" o "Flowspec"
+	Details   string    `json:"details"`
+	Community string    `json:"community"`
+	Time      time.Time `json:"time"`
+}
+
+// BGPManager maneja la interacción con GoBGP para anunciar bloqueos
+type BGPManager struct {
+	cfg           config.BGPConfig
+	announcements map[string]BGPAnnouncement
+	mu            sync.RWMutex
+	// Inyectable para tests
+	Executor func(args []string) error
+}
+
+func NewBGPManager(cfg config.BGPConfig) *BGPManager {
+	m := &BGPManager{
+		cfg:           cfg,
+		announcements: make(map[string]BGPAnnouncement),
+	}
+	// Ejecutor por defecto (GoBGP real)
+	m.Executor = m.runGoBGP
+	return m
+}
+
+// AnnounceBlock lanza un comando gobgp para anunciar un RTBH (/32)
+func (b *BGPManager) AnnounceBlock(ip string, duration int) error {
+	prefix := ip + "/32"
+
+	b.mu.Lock()
+	b.announcements[prefix] = BGPAnnouncement{
+		ID:        prefix,
+		Prefix:    prefix,
+		Type:      "RTBH",
+		Details:   "Full IP block (RTBH)",
+		Community: b.cfg.Community,
+		Time:      time.Now(),
+	}
+	b.mu.Unlock()
+
+	args := []string{"global", "rib", "add", "-a", "ipv4", prefix}
+	if b.cfg.Community != "" {
+		args = append(args, "community", b.cfg.Community)
+	}
+	if b.cfg.NextHop != "" {
+		args = append(args, "nexthop", b.cfg.NextHop)
+	}
+
+	err := b.Executor(args)
+	if err != nil {
+		return err
+	}
+
+	// Si tiene duración, programar retirada
+	if duration > 0 {
+		go func() {
+			time.Sleep(time.Duration(duration) * time.Second)
+			log.Printf("[BGP] Auto-withdrawing RTBH %s after %ds", prefix, duration)
+			if err := b.WithdrawBlock(ip); err != nil {
+				log.Printf("[BGP] Failed to auto-withdraw RTBH %s: %v", prefix, err)
+			}
+		}()
+	}
+
+	return nil
+}
+
+// WithdrawBlock retira un anuncio RTBH
+func (b *BGPManager) WithdrawBlock(ip string) error {
+	prefix := ip + "/32"
+
+	b.mu.Lock()
+	delete(b.announcements, prefix)
+	b.mu.Unlock()
+
+	args := []string{"global", "rib", "del", "-a", "ipv4", prefix}
+	return b.Executor(args)
+}
+
+// AnnounceFlowspec lanza un comando gobgp con la receta detallada del filtro
+func (b *BGPManager) AnnounceFlowspec(m packet.Mitigation) error {
+	if m.SourceIP == "" {
+		return fmt.Errorf("missing source IP for flowspec")
+	}
+
+	id := fmt.Sprintf("flow-%s-%s", m.Name, m.SourceIP)
+
+	b.mu.Lock()
+	b.announcements[id] = BGPAnnouncement{
+		ID:        id,
+		Prefix:    m.SourceIP,
+		Type:      "Flowspec",
+		Details:   fmt.Sprintf("%s: %s", m.Name, m.Reason),
+		Community: "Flowspec Action",
+		Time:      time.Now(),
+	}
+	b.mu.Unlock()
+
+	// Construir comando GoBGP Flowspec
+	args := []string{"global", "rib", "add", "-a", "ipv4-flowspec", "match", "source", m.SourceIP + "/32"}
+
+	if m.DestIP != "" {
+		args = append(args, "destination", m.DestIP+"/32")
+	}
+	if m.Protocol != "" {
+		args = append(args, "protocol", strings.ToLower(m.Protocol))
+	}
+	if m.DestPort != 0 {
+		args = append(args, "destination-port", strconv.Itoa(int(m.DestPort)))
+	}
+	if m.SourcePort != 0 {
+		args = append(args, "source-port", strconv.Itoa(int(m.SourcePort)))
+	}
+	if m.PacketLenMin > 0 || m.PacketLenMax > 0 {
+		lenMatch := ""
+		if m.PacketLenMin > 0 && m.PacketLenMax > 0 {
+			lenMatch = fmt.Sprintf(">=%d&<=%d", m.PacketLenMin, m.PacketLenMax)
+		} else if m.PacketLenMin > 0 {
+			lenMatch = fmt.Sprintf(">=%d", m.PacketLenMin)
+		} else {
+			lenMatch = fmt.Sprintf("<=%d", m.PacketLenMax)
+		}
+		args = append(args, "packet-length", lenMatch)
+	}
+
+	// Acción técnica
+	if m.RateLimit > 0 {
+		args = append(args, "then", "rate-limit", strconv.Itoa(int(m.RateLimit)))
+	} else {
+		args = append(args, "then", "discard")
+	}
+
+	if !b.cfg.Enabled {
+		log.Printf("[BGP] Simulation: %s", strings.Join(args, " "))
+	} else {
+		err := b.Executor(args)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Si tiene duración, programar la retirada
+	if m.Duration > 0 {
+		go func() {
+			time.Sleep(time.Duration(m.Duration) * time.Second)
+			log.Printf("[BGP] Auto-withdrawing rule %s after %ds", id, m.Duration)
+			if err := b.WithdrawFlowspec(m); err != nil {
+				log.Printf("[BGP] Failed to auto-withdraw flowspec %s: %v", id, err)
+			}
+		}()
+	}
+
+	return nil
+}
+
+// WithdrawFlowspec retira una regla de Flowspec previamente anunciada
+func (b *BGPManager) WithdrawFlowspec(m packet.Mitigation) error {
+	id := fmt.Sprintf("flow-%s-%s", m.Name, m.SourceIP)
+
+	b.mu.Lock()
+	delete(b.announcements, id)
+	b.mu.Unlock()
+
+	args := []string{"global", "rib", "del", "-a", "ipv4-flowspec", "match", "source", m.SourceIP + "/32"}
+
+	if m.DestIP != "" {
+		args = append(args, "destination", m.DestIP+"/32")
+	}
+	if m.Protocol != "" {
+		args = append(args, "protocol", strings.ToLower(m.Protocol))
+	}
+	if m.DestPort != 0 {
+		args = append(args, "destination-port", strconv.Itoa(int(m.DestPort)))
+	}
+
+	if !b.cfg.Enabled {
+		log.Printf("[BGP] Simulation: (Withdraw) %s", strings.Join(args, " "))
+		return nil
+	}
+
+	return b.Executor(args)
+}
+
+func (b *BGPManager) runGoBGP(args []string) error {
+	cmd := exec.Command("gobgp", args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("gobgp error: %v, output: %s", err, string(output))
+	}
+	return nil
+}
+
+func (b *BGPManager) GetAnnouncements() []BGPAnnouncement {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	out := make([]BGPAnnouncement, 0, len(b.announcements))
+	for _, a := range b.announcements {
+		out = append(out, a)
+	}
+	return out
+}
+
+================================================================================
+FILE: mitigation/bgp_test.go
+================================================================================
+package mitigation
+
+import (
+	"dolly-sensor/config"
+	"dolly-sensor/packet"
+	"sync"
+	"testing"
+	"time"
+)
+
+func TestBGPAutoWithdraw(t *testing.T) {
+	cfg := config.BGPConfig{Enabled: true}
+	mgr := NewBGPManager(cfg)
+
+	var mu sync.Mutex
+	calls := []string{}
+	mgr.Executor = func(args []string) error {
+		mu.Lock()
+		calls = append(calls, args[2]) // "add" o "del"
+		mu.Unlock()
+		return nil
+	}
+
+	m := packet.Mitigation{
+		SourceIP: "1.1.1.1",
+		Name:     "TEST-RULE",
+		Duration: 1, // 1 segundo
+	}
+
+	err := mgr.AnnounceFlowspec(m)
+	if err != nil {
+		t.Fatalf("Error en AnnounceFlowspec: %v", err)
+	}
+
+	// Verificar anuncio inmediato
+	mu.Lock()
+	if len(calls) != 1 || calls[0] != "add" {
+		t.Errorf("Se esperaba 1 llamada 'add', obtenidas: %v", calls)
+	}
+	mu.Unlock()
+
+	// Esperar a la retirada (1.1s para margen)
+	time.Sleep(1200 * time.Millisecond)
+
+	mu.Lock()
+	if len(calls) != 2 || calls[1] != "del" {
+		t.Errorf("Se esperaba 2 llamadas (add + del), obtenidas: %v", calls)
+	}
+	mu.Unlock()
+}
+
+
+================================================================================
+FILE: mitigation/blocklist.go
+================================================================================
+package mitigation
+
+import (
+	"bufio"
+	"log"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+)
+
+// BlocklistEngine maneja grandes listas de IPs y CIDRs para bloqueo
+type BlocklistEngine struct {
+	mu       sync.RWMutex
+	ips      map[string]struct{}
+	networks []*net.IPNet
+	path     string
+
+	// Para no disparar BGP repetidamente para la misma IP
+	triggered   map[string]bool
+	triggeredMu sync.Mutex
+}
+
+func NewBlocklistEngine() *BlocklistEngine {
+	return &BlocklistEngine{
+		ips:       make(map[string]struct{}),
+		triggered: make(map[string]bool),
+	}
+}
+
+// LoadFromPath lee todos los archivos .txt o .list de una carpeta y carga las IPs
+func (e *BlocklistEngine) LoadFromPath(path string) error {
+	e.mu.Lock()
+	e.path = path
+	e.mu.Unlock()
+
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return os.MkdirAll(path, 0755)
+	}
+
+	files, err := os.ReadDir(path)
+	if err != nil {
+		return err
+	}
+
+	newIPs := make(map[string]struct{})
+	var newNets []*net.IPNet
+
+	for _, f := range files {
+		if f.IsDir() {
+			continue
+		}
+		fullPath := filepath.Join(path, f.Name())
+		e.parseFile(fullPath, newIPs, &newNets)
+	}
+
+	e.mu.Lock()
+	e.ips = newIPs
+	e.networks = newNets
+	e.mu.Unlock()
+
+	log.Printf("[BLOCKLIST] Loaded %d IPs and %d CIDRs from %s", len(newIPs), len(newNets), path)
+	return nil
+}
+
+func (e *BlocklistEngine) parseFile(path string, ips map[string]struct{}, nets *[]*net.IPNet) {
+	file, err := os.Open(path)
+	if err != nil {
+		log.Printf("[BLOCKLIST] Error opening %s: %v", path, err)
+		return
+	}
+	defer func() {
+		if cerr := file.Close(); cerr != nil {
+			log.Printf("[BLOCKLIST] Error closing %s: %v", path, cerr)
+		}
+	}()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		if strings.Contains(line, "/") {
+			_, ipnet, err := net.ParseCIDR(line)
+			if err == nil {
+				*nets = append(*nets, ipnet)
+			}
+		} else {
+			ip := net.ParseIP(line)
+			if ip != nil {
+				ips[ip.String()] = struct{}{}
+			}
+		}
+	}
+}
+
+// Count retorna el total de entradas cargadas
+func (e *BlocklistEngine) Count() int {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return len(e.ips) + len(e.networks)
+}
+
+// IsBlocked verifica si una IP está en la lista negra
+func (e *BlocklistEngine) IsBlocked(ipStr string) bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	if _, ok := e.ips[ipStr]; ok {
+		return true
+	}
+
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+	for _, network := range e.networks {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// AddManualBlock añade una IP o CIDR al archivo manual.list y recarga
+func (e *BlocklistEngine) AddManualBlock(entry string) error {
+	e.mu.RLock()
+	basePath := e.path
+	e.mu.RUnlock()
+
+	if basePath == "" {
+		basePath = "blocklists/"
+	}
+	filePath := filepath.Join(basePath, "manual.list")
+
+	f, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := f.Close(); cerr != nil {
+			log.Printf("[BLOCKLIST] Error closing %s: %v", filePath, cerr)
+		}
+	}()
+
+	if _, err := f.WriteString(entry + "\n"); err != nil {
+		return err
+	}
+	return e.LoadFromPath(basePath)
+}
+
+// GetFiles retorna la lista de archivos en la carpeta de blocklists
+func (e *BlocklistEngine) GetFiles() []string {
+	e.mu.RLock()
+	basePath := e.path
+	e.mu.RUnlock()
+
+	files, err := os.ReadDir(basePath)
+	if err != nil {
+		return nil
+	}
+
+	var out []string
+	for _, f := range files {
+		if !f.IsDir() && !strings.HasPrefix(f.Name(), ".") {
+			out = append(out, f.Name())
+		}
+	}
+	return out
+}
+
+// MarkTriggered marca una IP como ya procesada por BGP para evitar spam
+func (e *BlocklistEngine) MarkTriggered(ip string) bool {
+	e.triggeredMu.Lock()
+	defer e.triggeredMu.Unlock()
+	if e.triggered[ip] {
+		return false
+	}
+	e.triggered[ip] = true
+	return true
+}
+
+func (e *BlocklistEngine) ClearTriggered(ip string) {
+	e.triggeredMu.Lock()
+	defer e.triggeredMu.Unlock()
+	delete(e.triggered, ip)
+}
+
+================================================================================
+FILE: mitigation/blocklist_test.go
+================================================================================
+package mitigation
+
+import (
+	"testing"
+)
+
+func TestBlocklist(t *testing.T) {
+	e := NewBlocklistEngine()
+
+	// 1. Test Triggered logic
+	if !e.MarkTriggered("test-1") {
+		t.Error("Debería haber marcado como triggered por primera vez")
+	}
+	if e.MarkTriggered("test-1") {
+		t.Error("No debería permitir marcar dos veces lo mismo")
+	}
+
+	e.ClearTriggered("test-1")
+	if !e.MarkTriggered("test-1") {
+		t.Error("Debería permitir marcar de nuevo tras el Clear")
+	}
+
+	// 2. Test IPs (Simulando carga manual)
+	e.ips["1.2.3.4"] = struct{}{}
+	if !e.IsBlocked("1.2.3.4") {
+		t.Error("IP 1.2.3.4 debería estar bloqueada")
+	}
+	if e.IsBlocked("8.8.8.8") {
+		t.Error("IP 8.8.8.8 NO debería estar bloqueada")
+	}
+}
+
+
+================================================================================
+FILE: packet/event.go
+================================================================================
+package packet
+
+import (
+	"fmt"
+	"time"
+)
+
+type Event struct {
+	ID                 int64     `json:"id"`
+	Timestamp          time.Time `json:"timestamp"`
+	AgentIP            string    `json:"agent_ip"`
+	RemoteAddr         string    `json:"remote_addr"`
+	DatagramSequence   uint32    `json:"datagram_sequence"`
+	SampleSequence     uint32    `json:"sample_sequence"`
+	SampleType         string    `json:"sample_type"`
+	SourceID           string    `json:"source_id"`
+	Input              string    `json:"input"`
+	Output             string    `json:"output"`
+	SamplingRate       uint32    `json:"sampling_rate"`
+	SamplePool         uint32    `json:"sample_pool"`
+	Drops              uint32    `json:"drops"`
+	RecordIndex        uint32    `json:"record_index"`
+	HeaderProtocol     uint32    `json:"header_protocol"`
+	FrameLength        uint32    `json:"frame_length"`
+	Stripped           uint32    `json:"stripped"`
+	HeaderLength       uint32    `json:"header_length"`
+	DstMAC             string    `json:"dst_mac"`
+	SrcMAC             string    `json:"src_mac"`
+	EtherType          string    `json:"ether_type"`
+	Network            string    `json:"network"`
+	Protocol           string    `json:"protocol"`
+	Details            string    `json:"details"`
+	SrcIP              string    `json:"src_ip"`
+	DstIP              string    `json:"dst_ip"`
+	TTL                uint8     `json:"ttl"`
+	IPFlags            string    `json:"ip_flags"`
+	FragOffset         uint16    `json:"frag_offset"`
+	IPTotalLen         uint16    `json:"ip_total_len"`
+	MaxMTU             uint16    `json:"max_mtu"`
+	IPProtocol         string    `json:"ip_protocol"`
+	Transport          string    `json:"transport"`
+	SrcPort            uint16    `json:"src_port"`
+	DstPort            uint16    `json:"dst_port"`
+	TCPSeq             uint32    `json:"tcp_seq"`
+	TCPAck             uint32    `json:"tcp_ack"`
+	TCPFlags           string    `json:"tcp_flags"`
+	HandshakeComplete  bool      `json:"handshake_complete"`
+	HandshakeStep      int       `json:"handshake_step"`
+	InEstablishedSession bool    `json:"in_established_session"`
+	ARPSourceIP        string    `json:"arp_source_ip"`
+	ARPTargetIP        string    `json:"arp_target_ip"`
+	ICMPType           string    `json:"icmp_type"`
+	DNSQuery           string    `json:"dns_query"`
+	HTTPStartLine      string    `json:"http_start_line"`
+	SSHBanner          string    `json:"ssh_banner"`
+	FilterName         string    `json:"filter_name"`
+	FilterAction       string    `json:"filter_action"`
+	FilterReason       string    `json:"filter_reason"`
+	Allowed            bool      `json:"allowed"`
+	Alert              bool      `json:"alert"`
+	AlertName          string    `json:"alert_name"`
+	AlertReason        string    `json:"alert_reason"`
+	CurrentPPS         float64   `json:"current_pps"`
+	SourcePPS          float64   `json:"source_pps"`
+	SourceTrustScore   int       `json:"source_trust_score"`
+	BaselinePPS        float64   `json:"baseline_pps"`
+	SpikePPS           float64   `json:"spike_pps"`
+	ProfileActive      bool      `json:"profile_active"`
+	ProfileKey         string    `json:"profile_key"`
+	DestinationIsLocal bool      `json:"destination_is_local"`
+	PayloadHex         string    `json:"payload_hex"`
+	Summary            string    `json:"summary"`
+}
+
+func (e Event) BestProtocol() string {
+	if e.Protocol != "" {
+		return e.Protocol
+	}
+	if e.Transport != "" {
+		return e.Transport
+	}
+	if e.IPProtocol != "" {
+		return e.IPProtocol
+	}
+	if e.Network != "" {
+		return e.Network
+	}
+	return "-"
+}
+
+func (e Event) SummaryString() string {
+	base := fmt.Sprintf("%s sample=%d record=%d", e.SampleType, e.SampleSequence, e.RecordIndex)
+	proto := e.BestProtocol()
+
+	if e.SrcIP != "" || e.DstIP != "" {
+		addr := fmt.Sprintf("%s:%d -> %s:%d", zeroIfEmpty(e.SrcIP), e.SrcPort, zeroIfEmpty(e.DstIP), e.DstPort)
+		if e.Details != "" {
+			return fmt.Sprintf("%s %s %s %s [%s]", base, proto, addr, e.Details, e.FilterAction)
+		}
+		return fmt.Sprintf("%s %s %s [%s]", base, proto, addr, e.FilterAction)
+	}
+
+	if e.Protocol == "ARP" {
+		if e.Details != "" {
+			return fmt.Sprintf("%s %s %s [%s]", base, e.Protocol, e.Details, e.FilterAction)
+		}
+		return fmt.Sprintf("%s %s [%s]", base, e.Protocol, e.FilterAction)
+	}
+
+	return fmt.Sprintf("%s proto=%s frameLen=%d [%s]", base, zeroIfEmpty(proto), e.FrameLength, e.FilterAction)
+}
+
+func zeroIfEmpty(v string) string {
+	if v == "" {
+		return "-"
+	}
+	return v
+}
+
+
+================================================================================
+FILE: packet/mitigation.go
+================================================================================
+package packet
+
+// Mitigation representa una decisión de bloqueo o acción técnica tomada por un filtro
+type Mitigation struct {
+	Alert  bool   `json:"alert"`
+	Name   string `json:"name"`
+	Reason string `json:"reason"`
+	Block  bool   `json:"block"`
+	
+	// Receta de Bloqueo (Flowspec Ready)
+	SourceIP      string `json:"source_ip"`
+	DestIP        string `json:"dest_ip"`
+	Protocol      string `json:"protocol"` // "TCP", "UDP", etc
+	SourcePort    uint16 `json:"source_port"`
+	DestPort      uint16 `json:"dest_port"`
+	PacketLenMin  uint16 `json:"packet_len_min"`
+	PacketLenMax  uint16 `json:"packet_len_max"`
+	
+	// Tipo de acción técnica
+	Drop          bool   `json:"drop"`
+	RateLimit     uint32 `json:"rate_limit"` // PPS si no es drop total
+	Duration      int    `json:"duration"`   // Segundos antes de retirar la regla
+}
+
+
+================================================================================
+FILE: packet/profile.go
+================================================================================
+package packet
+
+import (
+	"dolly-sensor/trustscore"
+	"sync"
+	"time"
+)
+
+type IPProfile struct {
+	IP             string    `json:"ip"`
+	LastUpdated    time.Time `json:"last_updated"`
+
+	// 1. Entropía y Diversidad
+	SourceDiversity float64   `json:"source_diversity_index"` // unique_ips / total_packets
+	UniqueSources   int       `json:"unique_sources"`
+
+	// 2. Ratios de Conexión
+	SYNAckRatio    float64   `json:"syn_ack_ratio"` // SYNs / (ACKs + 1)
+	TCPFlagsCount  map[string]int `json:"tcp_flags_distribution"`
+
+	// 3. Distribución de Tamaños (Histograma)
+	SizeDistribution struct {
+		Small  int `json:"64_128b"`
+		Medium int `json:"129_512b"`
+		Large  int `json:"513_1500b"`
+	} `json:"packet_size_distribution"`
+
+	// 4. Huellas de TTL
+	TopTTLs map[uint8]int `json:"top_ttl_fingerprints"`
+
+	// 5. Baselines (Volumen)
+	CurrentPPS float64 `json:"current_pps"`
+	CurrentMbps float64 `json:"current_mbps"`
+
+	// Metadata para alertas
+	IsAnomalous        bool    `json:"is_anomalous"`
+	RiskScore          int     `json:"risk_score"`
+	TrustedTrafficRatio float64 `json:"trusted_traffic_ratio"`
+}
+
+// PersistentProfile representa el estado a largo plazo de una IP nuestra en data/IP.json
+type PersistentProfile struct {
+	mu          sync.RWMutex `json:"-"`
+	IP          string       `json:"ip"`
+	FirstSeen   time.Time    `json:"first_seen"`
+	LastUpdated time.Time    `json:"last_updated"`
+
+	StatsHistoricas struct {
+		MaxPPS                float64 `json:"max_pps"`
+		MaxMbps               float64 `json:"max_mbps"`
+		TotalPacketsProcessed uint64  `json:"total_packets_processed"`
+		TotalBytesProcessed   uint64  `json:"total_bytes_processed"`
+	} `json:"stats_historicas"`
+
+	DistribucionFlagsTotal map[string]uint64 `json:"distribucion_flags_total"`
+	ProtocolosFrecuentes   map[string]uint64 `json:"protocolos_frecuentes"`
+	DistribucionTTL        map[uint8]uint64  `json:"distribucion_ttl"`
+
+	// Reputación de orígenes específica para esta IP de destino (Migrado a TrustScore)
+	ReputacionOrigenes map[string]*trustscore.SourceTrust `json:"reputacion_origenes"`
+
+	PuertosFrecuentes       map[uint16]uint64 `json:"puertos_frecuentes"`
+	SourcePortsFrecuentes   map[uint16]uint64 `json:"source_ports_frecuentes"`
+
+	PerfilTrafico struct {
+		TTLDominante uint8 `json:"ttl_dominante"`
+		MTUPromedio  int   `json:"mtu_promedio"`
+	} `json:"perfil_trafico"`
+}
+
+func (p *PersistentProfile) Lock() { p.mu.Lock() }
+func (p *PersistentProfile) Unlock() { p.mu.Unlock() }
+func (p *PersistentProfile) RLock() { p.mu.RLock() }
+func (p *PersistentProfile) RUnlock() { p.mu.RUnlock() }
+
+
+================================================================================
+FILE: packet/protocols.go
+================================================================================
+package packet
+
+import (
+	"encoding/json"
+	"os"
+)
+
+type PortMapping struct {
+	Port  uint16   `json:"port,omitempty"`
+	Range []uint16 `json:"range,omitempty"`
+	Name  string   `json:"name"`
+}
+
+type ProtocolMap struct {
+	TCP []PortMapping `json:"TCP"`
+	UDP []PortMapping `json:"UDP"`
+}
+
+var GlobalProtocols ProtocolMap
+
+func LoadProtocols(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(data, &GlobalProtocols)
+}
+
+func (pm ProtocolMap) GetName(transport string, port uint16) string {
+	var list []PortMapping
+	switch transport {
+	case "TCP":
+		list = pm.TCP
+	case "UDP":
+		list = pm.UDP
+	}
+
+	for _, m := range list {
+		if m.Port != 0 && m.Port == port {
+			return m.Name
+		}
+		if len(m.Range) == 2 && port >= m.Range[0] && port <= m.Range[1] {
+			return m.Name
+		}
+	}
+	return ""
+}
+
+================================================================================
+FILE: profiler/profiler.go
+================================================================================
+package profiler
+
+import (
+	"dolly-sensor/config"
+	"dolly-sensor/packet"
+	"dolly-sensor/store"
+	"dolly-sensor/trustscore"
+	"encoding/json"
+	"log"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+)
+
+type Profiler struct {
+	store    *store.Store
+	cfg      config.Config
+	interval time.Duration
+	baseDir  string // profiles/
+	dataDir  string // data/
+
+	// Cache de perfiles persistentes en memoria
+	muCache sync.RWMutex
+	cache   map[string]*packet.PersistentProfile
+}
+
+func NewProfiler(s *store.Store, cfg config.Config, interval time.Duration) *Profiler {
+	baseDir := "profiles"
+	if err := os.MkdirAll(baseDir, 0755); err != nil {
+		log.Printf("[PROFILER] error creating profiles dir: %v", err)
+	}
+	dataDir := "data"
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		log.Printf("[PROFILER] error creating data dir: %v", err)
+	}
+
+	p := &Profiler{
+		store:    s,
+		cfg:      cfg,
+		interval: interval,
+		baseDir:  baseDir,
+		dataDir:  dataDir,
+		cache:    make(map[string]*packet.PersistentProfile),
+	}
+	p.warmupCache()
+	return p
+}
+
+func (p *Profiler) warmupCache() {
+	entries, err := os.ReadDir(p.dataDir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			ip := entry.Name()
+			if net.ParseIP(ip) != nil {
+				p.loadPersistentProfile(ip)
+			}
+		}
+	}
+	log.Printf("[PROFILER] Cache warmed up with %d profiles", len(p.cache))
+}
+
+func (p *Profiler) Start() {
+	log.Printf("[PROFILER] starting with interval %v", p.interval)
+	ticker := time.NewTicker(p.interval)
+	saveTicker := time.NewTicker(5 * time.Minute)
+
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				p.processAllDestinations()
+			case <-saveTicker.C:
+				p.saveAllToDisk()
+			}
+		}
+	}()
+}
+
+func (p *Profiler) saveAllToDisk() {
+	p.muCache.RLock()
+	ips := make([]string, 0, len(p.cache))
+	for ip := range p.cache {
+		ips = append(ips, ip)
+	}
+	p.muCache.RUnlock()
+
+	for _, ip := range ips {
+		p.muCache.RLock()
+		pers := p.cache[ip]
+		p.muCache.RUnlock()
+		if pers != nil {
+			p.savePersistentProfile(pers)
+		}
+	}
+}
+
+func (p *Profiler) processAllDestinations() {
+	packets := p.store.Snapshot()
+	if len(packets) == 0 {
+		return
+	}
+
+	byDest := make(map[string][]packet.Event)
+	cutoff := time.Now().Add(-p.interval)
+
+	for _, pkt := range packets {
+		if pkt.Timestamp.After(cutoff) && pkt.DstIP != "" {
+			byDest[pkt.DstIP] = append(byDest[pkt.DstIP], pkt)
+		}
+	}
+
+	for ip, pkts := range byDest {
+		pers := p.loadPersistentProfile(ip)
+		profile := p.calculateProfile(ip, pkts, pers)
+		p.updatePersistentProfile(pers, profile, pkts)
+		p.saveProfile(profile)
+	}
+}
+
+func (p *Profiler) calculateProfile(ip string, pkts []packet.Event, pers *packet.PersistentProfile) packet.IPProfile {
+	prof := packet.IPProfile{
+		IP:            ip,
+		LastUpdated:   time.Now(),
+		TCPFlagsCount: make(map[string]int),
+		TopTTLs:       make(map[uint8]int),
+	}
+
+	uniqueSources := make(map[string]struct{})
+	synCount, ackCount := 0, 0
+	var totalBytes uint64
+	var trustedPkts int
+
+	manualTrusted := make(map[string]bool)
+	for _, tip := range p.cfg.Local.TrustedIPs {
+		manualTrusted[tip] = true
+	}
+
+	pers.Lock()
+	defer pers.Unlock()
+
+	for _, pkt := range pkts {
+		isManual := manualTrusted[pkt.SrcIP]
+		rep, ok := pers.ReputacionOrigenes[pkt.SrcIP]
+		if !ok {
+			rep = &trustscore.SourceTrust{IP: pkt.SrcIP}
+			pers.ReputacionOrigenes[pkt.SrcIP] = rep
+		}
+
+		// Mapear packet.Event a trustscore.TrustEvent para evitar ciclos
+		ev := trustscore.TrustEvent{
+			Protocol:             pkt.Protocol,
+			BestProtocol:         pkt.BestProtocol(),
+			SrcPort:              pkt.SrcPort,
+			TCPFlags:             pkt.TCPFlags,
+			HandshakeComplete:    pkt.HandshakeComplete,
+			InEstablishedSession: pkt.InEstablishedSession,
+		}
+		trustscore.UpdateTrustScore(rep, ev, isManual)
+
+		if isManual || rep.TrustScore >= 70 {
+			trustedPkts++
+		}
+
+		if pkt.SrcIP != "" {
+			uniqueSources[pkt.SrcIP] = struct{}{}
+		}
+
+		if pkt.Transport == "TCP" {
+			flags := strings.ToUpper(pkt.TCPFlags)
+			if strings.Contains(flags, "SYN") {
+				synCount++
+			}
+			if strings.Contains(flags, "ACK") {
+				ackCount++
+			}
+			prof.TCPFlagsCount[flags]++
+		}
+
+		size := pkt.IPTotalLen
+		if size <= 128 {
+			prof.SizeDistribution.Small++
+		} else if size <= 512 {
+			prof.SizeDistribution.Medium++
+		} else {
+			prof.SizeDistribution.Large++
+		}
+
+		prof.TopTTLs[pkt.TTL]++
+		totalBytes += uint64(pkt.IPTotalLen)
+		if pkt.CurrentPPS > prof.CurrentPPS {
+			prof.CurrentPPS = pkt.CurrentPPS
+		}
+	}
+
+	totalPkts := len(pkts)
+	if totalPkts > 0 {
+		prof.UniqueSources = len(uniqueSources)
+		prof.SourceDiversity = float64(prof.UniqueSources) / float64(totalPkts)
+		prof.SYNAckRatio = float64(synCount) / float64(ackCount+1)
+		prof.TrustedTrafficRatio = float64(trustedPkts) / float64(totalPkts)
+		prof.CurrentMbps = (float64(totalBytes) * 8 / 1000000) / p.interval.Seconds()
+	}
+
+	if prof.SYNAckRatio > 10 {
+		prof.RiskScore += 20
+	}
+	if prof.SourceDiversity < 0.05 {
+		prof.RiskScore += 30
+	}
+	if prof.CurrentPPS > 10000 {
+		prof.RiskScore += 10
+	}
+
+	if prof.TrustedTrafficRatio > 0.8 {
+		prof.RiskScore /= 4
+		prof.IsAnomalous = false
+	} else if prof.RiskScore > 40 {
+		prof.IsAnomalous = true
+	}
+
+	return prof
+}
+
+func (p *Profiler) loadPersistentProfile(ip string) *packet.PersistentProfile {
+	p.muCache.RLock()
+	if pers, ok := p.cache[ip]; ok {
+		p.muCache.RUnlock()
+		return pers
+	}
+	p.muCache.RUnlock()
+
+	p.muCache.Lock()
+	defer p.muCache.Unlock()
+	if pers, ok := p.cache[ip]; ok {
+		return pers
+	}
+
+	path := filepath.Join(p.dataDir, ip, "ip.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		pers := &packet.PersistentProfile{
+			IP:                     ip,
+			FirstSeen:              time.Now(),
+			LastUpdated:            time.Now(),
+			DistribucionFlagsTotal: make(map[string]uint64),
+			ProtocolosFrecuentes:   make(map[string]uint64),
+			DistribucionTTL:        make(map[uint8]uint64),
+			ReputacionOrigenes:     make(map[string]*trustscore.SourceTrust),
+			PuertosFrecuentes:      make(map[uint16]uint64),
+			SourcePortsFrecuentes:  make(map[uint16]uint64),
+		}
+		p.cache[ip] = pers
+		return pers
+	}
+
+	var pers packet.PersistentProfile
+	if err := json.Unmarshal(raw, &pers); err != nil {
+		log.Printf("[PROFILER] error unmarshaling persistent profile %s: %v", ip, err)
+		pers = packet.PersistentProfile{
+			IP:        ip,
+			FirstSeen: time.Now(),
+		}
+	}
+	if pers.DistribucionFlagsTotal == nil {
+		pers.DistribucionFlagsTotal = make(map[string]uint64)
+	}
+	if pers.ProtocolosFrecuentes == nil {
+		pers.ProtocolosFrecuentes = make(map[string]uint64)
+	}
+	if pers.DistribucionTTL == nil {
+		pers.DistribucionTTL = make(map[uint8]uint64)
+	}
+	if pers.ReputacionOrigenes == nil {
+		pers.ReputacionOrigenes = make(map[string]*trustscore.SourceTrust)
+	}
+	if pers.PuertosFrecuentes == nil {
+		pers.PuertosFrecuentes = make(map[uint16]uint64)
+	}
+	if pers.SourcePortsFrecuentes == nil {
+		pers.SourcePortsFrecuentes = make(map[uint16]uint64)
+	}
+	p.cache[ip] = &pers
+	return &pers
+}
+
+func (p *Profiler) updatePersistentProfile(pers *packet.PersistentProfile, prof packet.IPProfile, pkts []packet.Event) {
+	pers.Lock()
+	defer pers.Unlock()
+
+	pers.LastUpdated = time.Now()
+	if prof.CurrentPPS > pers.StatsHistoricas.MaxPPS {
+		pers.StatsHistoricas.MaxPPS = prof.CurrentPPS
+	}
+	if prof.CurrentMbps > pers.StatsHistoricas.MaxMbps {
+		pers.StatsHistoricas.MaxMbps = prof.CurrentMbps
+	}
+
+	var intervalBytes uint64
+	for _, pkt := range pkts {
+		pers.ProtocolosFrecuentes[pkt.Transport]++
+		pers.DistribucionTTL[pkt.TTL]++
+
+		if pkt.Transport == "TCP" && pkt.TCPFlags != "" {
+			pers.DistribucionFlagsTotal[strings.ToUpper(pkt.TCPFlags)]++
+		}
+		if pkt.DstPort != 0 {
+			pers.PuertosFrecuentes[pkt.DstPort]++
+		}
+		if pkt.SrcPort != 0 {
+			pers.SourcePortsFrecuentes[pkt.SrcPort]++
+		}
+		intervalBytes += uint64(pkt.IPTotalLen)
+	}
+
+	pers.StatsHistoricas.TotalPacketsProcessed += uint64(len(pkts))
+	pers.StatsHistoricas.TotalBytesProcessed += intervalBytes
+
+	var maxCount int
+	for ttl, count := range prof.TopTTLs {
+		if count > maxCount {
+			maxCount = count
+			pers.PerfilTrafico.TTLDominante = ttl
+		}
+	}
+
+	trustscore.ApplyDecay(pers.ReputacionOrigenes)
+
+	now := time.Now()
+	for _, conn := range p.store.GetActiveConnections() {
+		if conn.DstIP == pers.IP {
+			rep, ok := pers.ReputacionOrigenes[conn.SrcIP]
+			if !ok {
+				rep = &trustscore.SourceTrust{IP: conn.SrcIP, FirstSeen: now, SeenDays: make(map[string]bool)}
+				pers.ReputacionOrigenes[conn.SrcIP] = rep
+			}
+
+			// Si la conexión está activa, significa que hubo un handshake exitoso.
+			// Si aún no hemos marcado el handshake en la reputación, lo hacemos ahora.
+			if !rep.HandshakeCompleted {
+				rep.HandshakeCompleted = true
+				rep.AddScoreEvent(10, "Verified Established Connection")
+				rep.LastHandshakeAward = now
+			}
+
+			// Premios por persistencia
+			duration := now.Sub(conn.StartTime)
+			if duration >= 15*time.Minute && (rep.Last15mAward.IsZero() || now.Sub(rep.Last15mAward) >= 15*time.Minute) {
+				rep.AddScoreEvent(5, "Active connection (15m)")
+				rep.Last15mAward = now
+			}
+			if duration >= 30*time.Minute && (rep.Last30mAward.IsZero() || now.Sub(rep.Last30mAward) >= 30*time.Minute) {
+				rep.AddScoreEvent(10, "Persistent session bonus (30m)")
+				rep.Last30mAward = now
+			}
+		}
+	}
+}
+
+func (p *Profiler) savePersistentProfile(pers *packet.PersistentProfile) {
+	pers.RLock()
+	defer pers.RUnlock()
+
+	dir := filepath.Join(p.dataDir, pers.IP)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		log.Printf("[PROFILER] error creating dir %s: %v", dir, err)
+		return
+	}
+
+	path := filepath.Join(dir, "ip.json")
+	data, err := json.MarshalIndent(pers, "", "  ")
+	if err != nil {
+		log.Printf("[PROFILER] error marshaling profile %s: %v", pers.IP, err)
+		return
+	}
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		log.Printf("[PROFILER] error writing %s: %v", path, err)
+	}
+}
+
+func (p *Profiler) SetManualTrust(dstIP, srcIP string, trust bool) error {
+	pers := p.loadPersistentProfile(dstIP)
+	pers.Lock()
+	defer pers.Unlock()
+
+	rep, ok := pers.ReputacionOrigenes[srcIP]
+	if !ok {
+		rep = &trustscore.SourceTrust{IP: srcIP, FirstSeen: time.Now(), SeenDays: make(map[string]bool)}
+		pers.ReputacionOrigenes[srcIP] = rep
+	}
+	rep.IsManualTrust = trust
+	rep.LastSeen = time.Now()
+	if trust {
+		rep.TrustScore = 100
+	} else {
+		rep.UpdateScore()
+	}
+
+	go p.savePersistentProfile(pers)
+	return nil
+}
+
+func (p *Profiler) GetAllReputations() map[string]*trustscore.SourceTrust {
+	p.muCache.RLock()
+	defer p.muCache.RUnlock()
+
+	allReps := make(map[string]*trustscore.SourceTrust)
+	for _, pers := range p.cache {
+		pers.RLock()
+		for srcIP, rep := range pers.ReputacionOrigenes {
+			if existing, ok := allReps[srcIP]; !ok || rep.TrustScore > existing.TrustScore {
+				// Copia profunda del objeto de confianza
+				copyRep := *rep
+				allReps[srcIP] = &copyRep
+			}
+		}
+		pers.RUnlock()
+	}
+	return allReps
+}
+
+func (p *Profiler) GetProfile(ip string) *packet.PersistentProfile {
+	pers := p.loadPersistentProfile(ip)
+
+	// Crear una copia profunda para evitar "concurrent map iteration and map write"
+	pers.RLock()
+	defer pers.RUnlock()
+
+	copyPers := &packet.PersistentProfile{
+		IP:          pers.IP,
+		FirstSeen:   pers.FirstSeen,
+		LastUpdated: pers.LastUpdated,
+	}
+	copyPers.StatsHistoricas = pers.StatsHistoricas
+	copyPers.PerfilTrafico = pers.PerfilTrafico
+
+	// Copiar mapas uno a uno (Deep Copy)
+	copyPers.DistribucionFlagsTotal = make(map[string]uint64)
+	for k, v := range pers.DistribucionFlagsTotal {
+		copyPers.DistribucionFlagsTotal[k] = v
+	}
+
+	copyPers.ProtocolosFrecuentes = make(map[string]uint64)
+	for k, v := range pers.ProtocolosFrecuentes {
+		copyPers.ProtocolosFrecuentes[k] = v
+	}
+
+	copyPers.DistribucionTTL = make(map[uint8]uint64)
+	for k, v := range pers.DistribucionTTL {
+		copyPers.DistribucionTTL[k] = v
+	}
+
+	copyPers.PuertosFrecuentes = make(map[uint16]uint64)
+	for k, v := range pers.PuertosFrecuentes {
+		copyPers.PuertosFrecuentes[k] = v
+	}
+
+	copyPers.SourcePortsFrecuentes = make(map[uint16]uint64)
+	for k, v := range pers.SourcePortsFrecuentes {
+		copyPers.SourcePortsFrecuentes[k] = v
+	}
+
+	copyPers.ReputacionOrigenes = make(map[string]*trustscore.SourceTrust)
+	for k, v := range pers.ReputacionOrigenes {
+		// Aquí también necesitamos copiar el objeto de reputación porque el JSON encoder entrará en él
+		trust := *v
+		copyPers.ReputacionOrigenes[k] = &trust
+	}
+
+	return copyPers
+}
+
+func (p *Profiler) saveProfile(prof packet.IPProfile) {
+	filename := filepath.Join(p.baseDir, prof.IP+".json")
+	data, err := json.MarshalIndent(prof, "", "  ")
+	if err != nil {
+		log.Printf("[PROFILER] error marshaling profile %s: %v", prof.IP, err)
+		return
+	}
+	if err := os.WriteFile(filename, data, 0644); err != nil {
+		log.Printf("[PROFILER] error writing %s: %v", filename, err)
+	}
+}
+
+
+================================================================================
+FILE: sflow/decode.go
+================================================================================
+package sflow
+
+import (
+	"dolly-sensor/packet"
+	"encoding/binary"
+	"encoding/hex"
+	"fmt"
+	"net"
+	"strings"
+)
+
+func decodePacketLayers(header []byte, pkt *packet.Event) {
+	if len(header) >= 14 {
+		pkt.DstMAC = net.HardwareAddr(header[0:6]).String()
+		pkt.SrcMAC = net.HardwareAddr(header[6:12]).String()
+		etherType := binary.BigEndian.Uint16(header[12:14])
+		pkt.EtherType = fmt.Sprintf("0x%04x", etherType)
+
+		switch etherType {
+		case 0x0800:
+			pkt.Network = "IPv4"
+			decodeIPv4(header[14:], pkt)
+			return
+		case 0x0806:
+			pkt.Network = "ARP"
+			pkt.Protocol = "ARP"
+			decodeARP(header[14:], pkt)
+			return
+		case 0x86dd:
+			pkt.Network = "IPv6"
+			decodeIPv6(header[14:], pkt)
+			return
+		case 0x8100:
+			if len(header) >= 18 {
+				innerEtherType := binary.BigEndian.Uint16(header[16:18])
+				pkt.EtherType = fmt.Sprintf("0x8100 -> 0x%04x", innerEtherType)
+				switch innerEtherType {
+				case 0x0800:
+					pkt.Network = "IPv4"
+					decodeIPv4(header[18:], pkt)
+					return
+				case 0x0806:
+					pkt.Network = "ARP"
+					pkt.Protocol = "ARP"
+					decodeARP(header[18:], pkt)
+					return
+				case 0x86dd:
+					pkt.Network = "IPv6"
+					decodeIPv6(header[18:], pkt)
+					return
+				}
+			}
+		}
+	}
+
+	pkt.Network = protocolName(pkt.HeaderProtocol)
+	if pkt.Protocol == "" {
+		pkt.Protocol = pkt.Network
+	}
+}
+
+func decodeIPv4(payload []byte, pkt *packet.Event) {
+	if len(payload) < 20 {
+		return
+	}
+
+	ihl := int(payload[0]&0x0F) * 4
+	if ihl < 20 || len(payload) < ihl {
+		return
+	}
+
+	pkt.TTL = payload[8]
+	pkt.IPTotalLen = binary.BigEndian.Uint16(payload[2:4])
+	pkt.MaxMTU = 1500 // Por defecto, hasta que procesemos contadores sFlow de interfaz.
+
+	flagsAndOffset := binary.BigEndian.Uint16(payload[6:8])
+	pkt.IPFlags = formatIPFlags(byte(flagsAndOffset >> 13))
+	pkt.FragOffset = flagsAndOffset & 0x1FFF
+
+	proto := payload[9]
+	pkt.IPProtocol = transportName(proto)
+	pkt.SrcIP = net.IP(payload[12:16]).String()
+	pkt.DstIP = net.IP(payload[16:20]).String()
+
+	decodeTransport(proto, payload[ihl:], pkt)
+}
+
+func formatIPFlags(f byte) string {
+	var flags []string
+	if f&0x02 != 0 {
+		flags = append(flags, "DF")
+	}
+	if f&0x01 != 0 {
+		flags = append(flags, "MF")
+	}
+	if len(flags) == 0 {
+		return "none"
+	}
+	return strings.Join(flags, ",")
+}
+
+func decodeIPv6(payload []byte, pkt *packet.Event) {
+	if len(payload) < 40 {
+		return
+	}
+
+	nextHeader := payload[6]
+	pkt.TTL = payload[7]
+	pkt.IPTotalLen = binary.BigEndian.Uint16(payload[4:6]) + 40
+	pkt.MaxMTU = 1500
+	pkt.IPProtocol = transportName(nextHeader)
+	pkt.SrcIP = net.IP(payload[8:24]).String()
+	pkt.DstIP = net.IP(payload[24:40]).String()
+
+	decodeTransport(nextHeader, payload[40:], pkt)
+}
+
+func decodeTransport(proto byte, payload []byte, pkt *packet.Event) {
+	switch proto {
+	case 6:
+		pkt.Transport = "TCP"
+		pkt.Protocol = "TCP"
+		if len(payload) < 20 {
+			return
+		}
+		pkt.SrcPort = binary.BigEndian.Uint16(payload[0:2])
+		pkt.DstPort = binary.BigEndian.Uint16(payload[2:4])
+		pkt.TCPSeq = binary.BigEndian.Uint32(payload[4:8])
+		pkt.TCPAck = binary.BigEndian.Uint32(payload[8:12])
+		pkt.TCPFlags = formatTCPFlags(payload[13])
+		dataOffset := int(payload[12]>>4) * 4
+		if dataOffset < 20 || len(payload) < dataOffset {
+			return
+		}
+		decodeTCPApplication(payload[dataOffset:], pkt)
+	case 17:
+		pkt.Transport = "UDP"
+		pkt.Protocol = "UDP"
+		if len(payload) < 8 {
+			return
+		}
+		pkt.SrcPort = binary.BigEndian.Uint16(payload[0:2])
+		pkt.DstPort = binary.BigEndian.Uint16(payload[2:4])
+		decodeUDPApplication(payload[8:], pkt)
+	case 1:
+		pkt.Transport = "ICMP"
+		pkt.Protocol = "ICMP"
+		decodeICMP(payload, pkt, false)
+	case 58:
+		pkt.Transport = "ICMPv6"
+		pkt.Protocol = "ICMPv6"
+		decodeICMP(payload, pkt, true)
+	default:
+		pkt.Transport = transportName(proto)
+		pkt.Protocol = pkt.Transport
+	}
+}
+
+func formatTCPFlags(f byte) string {
+	var flags []string
+	if f&0x01 != 0 {
+		flags = append(flags, "FIN")
+	}
+	if f&0x02 != 0 {
+		flags = append(flags, "SYN")
+	}
+	if f&0x04 != 0 {
+		flags = append(flags, "RST")
+	}
+	if f&0x08 != 0 {
+		flags = append(flags, "PSH")
+	}
+	if f&0x10 != 0 {
+		flags = append(flags, "ACK")
+	}
+	if f&0x20 != 0 {
+		flags = append(flags, "URG")
+	}
+	if f&0x40 != 0 {
+		flags = append(flags, "ECE")
+	}
+	if f&0x80 != 0 {
+		flags = append(flags, "CWR")
+	}
+
+	if len(flags) == 0 {
+		return fmt.Sprintf("0x%02x", f)
+	}
+	return strings.Join(flags, "/")
+}
+
+func decodeARP(payload []byte, pkt *packet.Event) {
+	if len(payload) < 28 {
+		return
+	}
+
+	opcode := binary.BigEndian.Uint16(payload[6:8])
+	senderMAC := net.HardwareAddr(payload[8:14]).String()
+	senderIP := net.IP(payload[14:18]).String()
+	targetMAC := net.HardwareAddr(payload[18:24]).String()
+	targetIP := net.IP(payload[24:28]).String()
+
+	pkt.ARPSourceIP = senderIP
+	pkt.ARPTargetIP = targetIP
+	pkt.SrcMAC = senderMAC
+	pkt.DstMAC = targetMAC
+
+	switch opcode {
+	case 1:
+		pkt.Details = fmt.Sprintf("request %s asks for %s", senderIP, targetIP)
+	case 2:
+		pkt.Details = fmt.Sprintf("reply %s is-at %s for %s", senderIP, senderMAC, targetIP)
+	default:
+		pkt.Details = fmt.Sprintf("opcode=%d %s -> %s", opcode, senderIP, targetIP)
+	}
+}
+
+func decodeICMP(payload []byte, pkt *packet.Event, ipv6 bool) {
+	if len(payload) < 2 {
+		return
+	}
+
+	typ := payload[0]
+	code := payload[1]
+	if ipv6 {
+		pkt.ICMPType = icmpv6TypeName(typ, code)
+	} else {
+		pkt.ICMPType = icmpTypeName(typ, code)
+	}
+	pkt.Details = fmt.Sprintf("type=%d code=%d %s", typ, code, pkt.ICMPType)
+}
+
+func decodeUDPApplication(payload []byte, pkt *packet.Event) {
+	if name := packet.GlobalProtocols.GetName("UDP", pkt.SrcPort); name != "" {
+		pkt.Protocol = name
+	} else if name := packet.GlobalProtocols.GetName("UDP", pkt.DstPort); name != "" {
+		pkt.Protocol = name
+	}
+
+	if pkt.Protocol == "DNS" || pkt.SrcPort == 53 || pkt.DstPort == 53 {
+		decodeDNS(payload, pkt, false)
+	}
+}
+
+func decodeTCPApplication(payload []byte, pkt *packet.Event) {
+	// 1. Fallback por puerto (mapeo dinámico)
+	if name := packet.GlobalProtocols.GetName("TCP", pkt.SrcPort); name != "" {
+		pkt.Protocol = name
+	} else if name := packet.GlobalProtocols.GetName("TCP", pkt.DstPort); name != "" {
+		pkt.Protocol = name
+	}
+
+	if len(payload) == 0 {
+		if pkt.Protocol == "" && (pkt.SrcPort == 22 || pkt.DstPort == 22) {
+			pkt.Protocol = "SSH"
+			pkt.Details = "port 22"
+		}
+		return
+	}
+
+	// 2. Disectores específicos (pueden sobreescribir el nombre si detectan contenido)
+	if pkt.Protocol == "DNS" || pkt.SrcPort == 53 || pkt.DstPort == 53 {
+		if decodeDNS(payload, pkt, true) {
+			return
+		}
+	}
+
+	if isHTTPPayload(payload) {
+		pkt.Protocol = "HTTP"
+		pkt.HTTPStartLine = firstLine(payload)
+		pkt.Details = pkt.HTTPStartLine
+		return
+	}
+
+	if bytesHasPrefixFold(payload, "SSH-") {
+		pkt.Protocol = "SSH"
+		pkt.SSHBanner = firstLine(payload)
+		pkt.Details = pkt.SSHBanner
+		return
+	}
+}
+
+func decodeDNS(payload []byte, pkt *packet.Event, tcp bool) bool {
+	if tcp {
+		if len(payload) < 2 {
+			return false
+		}
+		msgLen := int(binary.BigEndian.Uint16(payload[0:2]))
+		if msgLen == 0 || len(payload) < 2+msgLen {
+			return false
+		}
+		payload = payload[2 : 2+msgLen]
+	}
+
+	if len(payload) < 12 {
+		return false
+	}
+
+	flags := binary.BigEndian.Uint16(payload[2:4])
+	qr := (flags & 0x8000) != 0
+	qdCount := binary.BigEndian.Uint16(payload[4:6])
+
+	pkt.Protocol = "DNS"
+	if qr {
+		pkt.Details = "response"
+	} else {
+		pkt.Details = "query"
+	}
+
+	if qdCount == 0 {
+		return true
+	}
+
+	name, ok := parseDNSName(payload, 12, 0)
+	if !ok {
+		return true
+	}
+	pkt.DNSQuery = name
+	return true
+}
+
+func parseDNSName(msg []byte, off int, depth int) (string, bool) {
+	if depth > 8 || off >= len(msg) {
+		return "", false
+	}
+
+	labels := make([]string, 0, 4)
+	for off < len(msg) {
+		l := int(msg[off])
+		off++
+		if l == 0 {
+			return strings.Join(labels, "."), true
+		}
+		if l&0xC0 == 0xC0 {
+			if off >= len(msg) {
+				return "", false
+			}
+			ptr := ((l & 0x3F) << 8) | int(msg[off])
+			name, ok := parseDNSName(msg, ptr, depth+1)
+			if !ok {
+				return "", false
+			}
+			labels = append(labels, name)
+			return strings.Join(labels, "."), true
+		}
+		if off+l > len(msg) {
+			return "", false
+		}
+		labels = append(labels, string(msg[off:off+l]))
+		off += l
+	}
+
+	return "", false
+}
+
+func protocolName(v uint32) string {
+	switch v {
+	case 1:
+		return "Ethernet"
+	case 11:
+		return "IPv4"
+	case 12:
+		return "IPv6"
+	default:
+		return fmt.Sprintf("header_protocol_%d", v)
+	}
+}
+
+func transportName(v byte) string {
+	switch v {
+	case 1:
+		return "ICMP"
+	case 6:
+		return "TCP"
+	case 17:
+		return "UDP"
+	case 58:
+		return "ICMPv6"
+	default:
+		return fmt.Sprintf("IP-%d", v)
+	}
+}
+
+func formatHexDump(b []byte) string {
+	lines := make([]string, 0, (len(b)+15)/16)
+	for i := 0; i < len(b); i += 16 {
+		end := i + 16
+		if end > len(b) {
+			end = len(b)
+		}
+		chunk := b[i:end]
+		lines = append(lines, fmt.Sprintf("%04x  %-47s", i, spacedHex(chunk)))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func spacedHex(b []byte) string {
+	raw := strings.ToUpper(hex.EncodeToString(b))
+	if len(raw) == 0 {
+		return ""
+	}
+
+	var sb strings.Builder
+	for i := 0; i < len(raw); i += 2 {
+		if i > 0 {
+			sb.WriteByte(' ')
+		}
+		sb.WriteString(raw[i : i+2])
+	}
+	return sb.String()
+}
+
+
+================================================================================
+FILE: sflow/helpers.go
+================================================================================
+package sflow
+
+import (
+	"fmt"
+	"strings"
+)
+
+func isHTTPPayload(payload []byte) bool {
+	line := firstLine(payload)
+	if line == "" {
+		return false
+	}
+
+	methods := []string{
+		"GET ", "POST ", "PUT ", "DELETE ", "HEAD ", "OPTIONS ",
+		"PATCH ", "CONNECT ", "TRACE ", "HTTP/1.", "HTTP/2",
+	}
+	for _, prefix := range methods {
+		if strings.HasPrefix(line, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func firstLine(payload []byte) string {
+	line := string(payload)
+	if idx := strings.IndexByte(line, '\n'); idx >= 0 {
+		line = line[:idx]
+	}
+	line = strings.TrimRight(line, "\r")
+	line = strings.TrimSpace(line)
+	if len(line) > 120 {
+		line = line[:120]
+	}
+	return line
+}
+
+func bytesHasPrefixFold(payload []byte, prefix string) bool {
+	if len(payload) < len(prefix) {
+		return false
+	}
+	return strings.EqualFold(string(payload[:len(prefix)]), prefix)
+}
+
+func icmpTypeName(typ, code byte) string {
+	switch typ {
+	case 0:
+		return "echo_reply"
+	case 3:
+		return fmt.Sprintf("destination_unreachable/%d", code)
+	case 5:
+		return "redirect"
+	case 8:
+		return "echo_request"
+	case 11:
+		return fmt.Sprintf("time_exceeded/%d", code)
+	default:
+		return fmt.Sprintf("icmp_%d", typ)
+	}
+}
+
+func icmpv6TypeName(typ, code byte) string {
+	switch typ {
+	case 128:
+		return "echo_request"
+	case 129:
+		return "echo_reply"
+	case 133:
+		return "router_solicitation"
+	case 134:
+		return "router_advertisement"
+	case 135:
+		return "neighbor_solicitation"
+	case 136:
+		return "neighbor_advertisement"
+	default:
+		return fmt.Sprintf("icmpv6_%d/%d", typ, code)
+	}
+}
+
+================================================================================
+FILE: sflow/listener.go
+================================================================================
+package sflow
+
+import (
+	"fmt"
+	"log"
+	"net"
+)
+
+const maxDatagramSize = 65535
+
+func Listen(listenAddr string, processor *Processor) error {
+	addr, err := net.ResolveUDPAddr("udp", listenAddr)
+	if err != nil {
+		return fmt.Errorf("resolve %s: %w", listenAddr, err)
+	}
+
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", listenAddr, err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	log.Printf("listening for sFlow on %s", listenAddr)
+
+	buf := make([]byte, maxDatagramSize)
+	for {
+		n, remote, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			log.Printf("read error: %v", err)
+			continue
+		}
+
+		processor.ParseDatagram(remote, append([]byte(nil), buf[:n]...))
+	}
+}
+
+================================================================================
+FILE: sflow/parser.go
+================================================================================
+package sflow
+
+import (
+	"dolly-sensor/analyzer"
+	"dolly-sensor/config"
+	"dolly-sensor/packet"
+	"dolly-sensor/store"
+	"encoding/binary"
+	"fmt"
+	"log"
+	"net"
+	"time"
+)
+
+type Processor struct {
+	store         *store.Store
+	perfilInbound *analyzer.PerfilInboundGlobal
+	ownedNets     []*net.IPNet
+	samplingRate  int
+	cfg           config.Config
+}
+
+type flowSampleInfo struct {
+	SampleSequence uint32
+	SampleType     string
+	SourceID       string
+	Input          string
+	Output         string
+	SamplingRate   uint32
+	SamplePool     uint32
+	Drops          uint32
+}
+
+type decoder struct {
+	buf []byte
+	off int
+}
+
+func NewProcessor(packetStore *store.Store, perfilInbound *analyzer.PerfilInboundGlobal, ownedNets []*net.IPNet, samplingRate int, cfg config.Config) *Processor {
+	return &Processor{
+		store:         packetStore,
+		perfilInbound: perfilInbound,
+		ownedNets:     ownedNets,
+		samplingRate:  samplingRate,
+		cfg:           cfg,
+	}
+}
+
+func (p *Processor) ParseDatagram(remote *net.UDPAddr, pkt []byte) {
+	d := decoder{buf: pkt}
+	version, err := d.u32()
+	if err != nil || version != 5 {
+		return
+	}
+
+	ipVersion, err := d.u32()
+	if err != nil {
+		return
+	}
+	agentIP, err := readAgentAddress(&d, ipVersion)
+	if err != nil {
+		return
+	}
+
+	_, _ = d.u32()
+	sequenceNumber, _ := d.u32()
+	_, _ = d.u32()
+	sampleCount, _ := d.u32()
+
+	for i := uint32(0); i < sampleCount; i++ {
+		if err := p.parseSample(&d, i, remote.String(), agentIP, sequenceNumber); err != nil {
+			log.Printf("[SFLOW] parseSample error (agent=%s seq=%d idx=%d): %v", agentIP, sequenceNumber, i, err)
+		}
+	}
+}
+
+func (p *Processor) parseSample(d *decoder, index uint32, remoteAddr, agentIP string, datagramSequence uint32) error {
+	format, _ := d.u32()
+	length, _ := d.u32()
+	body, err := d.bytes(pad4(int(length)))
+	if err != nil {
+		return err
+	}
+	body = body[:int(length)]
+
+	sampleType := format & 0x0FFF
+	if (format >> 12) != 0 {
+		return nil
+	}
+
+	switch sampleType {
+	case 1:
+		return p.parseFlowSample(body, false, remoteAddr, agentIP, datagramSequence)
+	case 3:
+		return p.parseFlowSample(body, true, remoteAddr, agentIP, datagramSequence)
+	}
+	return nil
+}
+
+func (p *Processor) parseFlowSample(body []byte, expanded bool, remoteAddr, agentIP string, datagramSequence uint32) error {
+	d := decoder{buf: body}
+	seq, _ := d.u32()
+	info := flowSampleInfo{SampleSequence: seq, SampleType: "flow_sample"}
+
+	if expanded {
+		dsClass, _ := d.u32()
+		dsIndex, _ := d.u32()
+		info.SourceID = fmt.Sprintf("%d/%d", dsClass, dsIndex)
+		info.SamplingRate, _ = d.u32()
+		info.SamplePool, _ = d.u32()
+		info.Drops, _ = d.u32()
+		inF, _ := d.u32()
+		inV, _ := d.u32()
+		_, _ = d.u32()
+		outF, _ := d.u32()
+		outV, _ := d.u32()
+		_, _ = d.u32()
+		info.Input, info.Output = fmt.Sprintf("%d/%d", inF, inV), fmt.Sprintf("%d/%d", outF, outV)
+	} else {
+		sourceID, _ := d.u32()
+		info.SourceID = formatSourceID(sourceID)
+		info.SamplingRate, _ = d.u32()
+		info.SamplePool, _ = d.u32()
+		info.Drops, _ = d.u32()
+		input, _ := d.u32()
+		output, _ := d.u32()
+		info.Input, info.Output = fmt.Sprintf("%d", input), fmt.Sprintf("%d", output)
+	}
+
+	recordCount, _ := d.u32()
+	for i := uint32(0); i < recordCount; i++ {
+		recFormat, _ := d.u32()
+		recLen, _ := d.u32()
+		recBody, err := d.bytes(pad4(int(recLen)))
+		if err != nil {
+			continue
+		}
+		if (recFormat>>12) == 0 && (recFormat&0x0FFF) == 1 {
+			pkt, ok, _ := p.parseRawPacketHeaderRecord(recBody[:int(recLen)], remoteAddr, agentIP, datagramSequence, info, i+1)
+			if ok && (p.isLocal(pkt.DstIP) || p.isLocal(pkt.SrcIP)) {
+				p.store.Add(pkt)
+			}
+		}
+	}
+	return nil
+}
+
+func (p *Processor) isLocal(ipStr string) bool {
+	if ipStr == "" {
+		return false
+	}
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+	for _, network := range p.ownedNets {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *Processor) parseRawPacketHeaderRecord(body []byte, remoteAddr, agentIP string, datagramSequence uint32, info flowSampleInfo, recordIndex uint32) (packet.Event, bool, error) {
+	d := decoder{buf: body}
+	hProto, _ := d.u32()
+	fLen, _ := d.u32()
+	stripped, _ := d.u32()
+	hLen, _ := d.u32()
+	headerBytes, err := d.bytes(pad4(int(hLen)))
+	if err != nil || len(headerBytes) == 0 {
+		return packet.Event{}, false, err
+	}
+
+	pkt := packet.Event{
+		Timestamp: time.Now(), AgentIP: agentIP, RemoteAddr: remoteAddr,
+		DatagramSequence: datagramSequence, SampleSequence: info.SampleSequence, SampleType: info.SampleType,
+		SourceID: info.SourceID, Input: info.Input, Output: info.Output,
+		SamplingRate: info.SamplingRate, SamplePool: info.SamplePool, Drops: info.Drops,
+		RecordIndex: recordIndex, HeaderProtocol: hProto, FrameLength: fLen, Stripped: stripped, HeaderLength: hLen,
+		PayloadHex: formatHexDump(headerBytes[:int(hLen)]),
+	}
+
+	decodePacketLayers(headerBytes[:int(hLen)], &pkt)
+	p.evaluarPerfilInbound(&pkt)
+	pkt.Summary = pkt.SummaryString()
+	return pkt, true, nil
+}
+
+func (p *Processor) evaluarPerfilInbound(pkt *packet.Event) {
+	resultado := p.perfilInbound.Evaluar(pkt, p.cfg)
+	pkt.Allowed, pkt.FilterAction, pkt.FilterName = true, "allowed", "global-inbound"
+	pkt.FilterReason = "global profile evaluated"
+
+	if !resultado.CoincideDestinoPropio {
+		pkt.FilterReason = "destination outside owned cidrs"
+		return
+	}
+
+	pkt.ProfileActive, pkt.ProfileKey, pkt.DestinationIsLocal = true, pkt.DstIP, true
+	pkt.CurrentPPS, pkt.SourcePPS, pkt.BaselinePPS, pkt.SpikePPS = resultado.PPSActual, resultado.SourcePPS, resultado.PPSBase, resultado.PPSThreshold
+
+	if resultado.Alerta {
+		pkt.Alert, pkt.AlertName, pkt.AlertReason = true, resultado.NombreAlerta, resultado.RazonAlerta
+	}
+}
+
+func pad4(n int) int              { return (n + 3) &^ 3 }
+func (d *decoder) remaining() int { return len(d.buf) - d.off }
+func (d *decoder) u32() (uint32, error) {
+	if d.remaining() < 4 {
+		return 0, fmt.Errorf("short")
+	}
+	v := binary.BigEndian.Uint32(d.buf[d.off : d.off+4])
+	d.off += 4
+	return v, nil
+}
+func (d *decoder) bytes(n int) ([]byte, error) {
+	if n < 0 || d.remaining() < n {
+		return nil, fmt.Errorf("short")
+	}
+	v := d.buf[d.off : d.off+n]
+	d.off += n
+	return v, nil
+}
+func readAgentAddress(d *decoder, ipVersion uint32) (string, error) {
+	if ipVersion == 1 {
+		b, err := d.bytes(4)
+		if err != nil {
+			return "", err
+		}
+		return net.IP(b).String(), nil
+	}
+	b, err := d.bytes(16)
+	if err != nil {
+		return "", err
+	}
+	return net.IP(b).String(), nil
+}
+func formatSourceID(v uint32) string { return fmt.Sprintf("%d/%d", v>>24, v&0x00FFFFFF) }
+
+
+================================================================================
+FILE: stateful/filter.go
+================================================================================
+package stateful
+
+import (
+	"dolly-sensor/packet"
+	"fmt"
+	"strings"
+)
+
+type SecurityCheck struct {
+	Alert  bool
+	Name   string
+	Reason string
+}
+
+// Validate realiza chequeos de seguridad basados puramente en el estado TCP
+func (t *TCPTracker) Validate(pkt *packet.Event) SecurityCheck {
+	if pkt.Transport != "TCP" {
+		return SecurityCheck{}
+	}
+
+	flags := strings.ToUpper(pkt.TCPFlags)
+	
+	// Detección de Out-of-State (ACK/PSH/RST sin conexión activa)
+	if !strings.Contains(flags, "SYN") {
+		t.muConns.RLock()
+		key := fmt.Sprintf("%s:%d->%s:%d", pkt.SrcIP, pkt.SrcPort, pkt.DstIP, pkt.DstPort)
+		_, exists := t.activeConns[key]
+		t.muConns.RUnlock()
+
+		if !exists {
+			if pkt.CurrentPPS > 100 { 
+				return SecurityCheck{
+					Alert:  true,
+					Name:   "🛡️ INVALID-TCP-STATE",
+					Reason: fmt.Sprintf("TCP %s detected without active session from %s", flags, pkt.SrcIP),
+				}
+			}
+		}
+	}
+
+	return SecurityCheck{}
+}
+
+
+================================================================================
+FILE: stateful/tcp.go
+================================================================================
+package stateful
+
+import (
+	"dolly-sensor/packet"
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+)
+
+type ActiveConn struct {
+	SrcIP     string    `json:"src_ip"`
+	SrcPort   uint16    `json:"src_port"`
+	DstIP     string    `json:"dst_ip"`
+	DstPort   uint16    `json:"dst_port"`
+	Protocol  string    `json:"protocol"`
+	StartTime time.Time `json:"start_time"`
+	LastSeen  time.Time `json:"last_seen"`
+}
+
+type handshakeState struct {
+	ExpectedClientSeq uint32
+	ExpectedClientAck uint32
+	Timestamp         time.Time
+}
+
+type TCPTracker struct {
+	muConns     sync.RWMutex
+	activeConns map[string]*ActiveConn
+
+	muSyn    sync.Mutex
+	synCache map[string]handshakeState
+}
+
+func NewTCPTracker() *TCPTracker {
+	t := &TCPTracker{
+		activeConns: make(map[string]*ActiveConn),
+		synCache:    make(map[string]handshakeState),
+	}
+	go t.synCacheCleaner()
+	return t
+}
+
+func (t *TCPTracker) synCacheCleaner() {
+	ticker := time.NewTicker(1 * time.Second)
+	for range ticker.C {
+		t.muSyn.Lock()
+		now := time.Now()
+		for k, state := range t.synCache {
+			if now.Sub(state.Timestamp) > 5*time.Second {
+				delete(t.synCache, k)
+			}
+		}
+		t.muSyn.Unlock()
+	}
+}
+
+func (t *TCPTracker) Track(pkt *packet.Event, isLocal func(string) bool) {
+	if pkt.Transport != "TCP" {
+		return
+	}
+
+	flags := strings.ToUpper(pkt.TCPFlags)
+	key := fmt.Sprintf("%s:%d->%s:%d", pkt.SrcIP, pkt.SrcPort, pkt.DstIP, pkt.DstPort)
+
+	t.muSyn.Lock()
+	switch flags {
+	case "SYN":
+		if isLocal(pkt.DstIP) {
+			pkt.HandshakeStep = 1
+			t.synCache[key] = handshakeState{ExpectedClientSeq: pkt.TCPSeq + 1, Timestamp: time.Now()}
+		}
+	case "SYN/ACK":
+		revKey := fmt.Sprintf("%s:%d->%s:%d", pkt.DstIP, pkt.DstPort, pkt.SrcIP, pkt.SrcPort)
+		if state, exists := t.synCache[revKey]; exists {
+			pkt.HandshakeStep = 2
+			state.ExpectedClientAck = pkt.TCPSeq + 1
+			state.Timestamp = time.Now()
+			t.synCache[revKey] = state
+		}
+	case "ACK":
+		if state, exists := t.synCache[key]; exists {
+			if isLocal(pkt.DstIP) && state.ExpectedClientAck > 0 {
+				if pkt.TCPSeq == state.ExpectedClientSeq && pkt.TCPAck == state.ExpectedClientAck {
+					pkt.HandshakeStep = 3
+					pkt.HandshakeComplete = true
+				}
+			}
+			delete(t.synCache, key)
+		}
+	}
+	t.muSyn.Unlock()
+
+	t.muConns.Lock()
+	defer t.muConns.Unlock()
+
+	if pkt.HandshakeComplete {
+		pkt.InEstablishedSession = true
+		t.activeConns[key] = &ActiveConn{
+			SrcIP:     pkt.SrcIP,
+			SrcPort:   pkt.SrcPort,
+			DstIP:     pkt.DstIP,
+			DstPort:   pkt.DstPort,
+			Protocol:  pkt.Protocol,
+			StartTime: time.Now(),
+			LastSeen:  time.Now(),
+		}
+	} else if conn, ok := t.activeConns[key]; ok {
+		pkt.InEstablishedSession = true
+		conn.LastSeen = time.Now()
+		if strings.Contains(flags, "FIN") || strings.Contains(flags, "RST") {
+			delete(t.activeConns, key)
+		}
+	}
+}
+
+func (t *TCPTracker) HasConnection(srcIP string, srcPort uint16, dstIP string, dstPort uint16) bool {
+	t.muConns.RLock()
+	defer t.muConns.RUnlock()
+	key := fmt.Sprintf("%s:%d->%s:%d", srcIP, srcPort, dstIP, dstPort)
+	_, exists := t.activeConns[key]
+	return exists
+}
+
+func (t *TCPTracker) GetActiveConnections() []ActiveConn {
+	t.muConns.RLock()
+	defer t.muConns.RUnlock()
+	out := make([]ActiveConn, 0, len(t.activeConns))
+	for _, conn := range t.activeConns {
+		out = append(out, *conn)
+	}
+	return out
+}
+
+func (t *TCPTracker) ValidateFlood(pkt *packet.Event, syn, ack int) SecurityCheck {
+	if pkt.Transport != "TCP" {
+		return SecurityCheck{}
+	}
+
+	// Si hay muchos SYNs y pocos ACKs de esta IP hacia el destino, es SYN Flood
+	if syn > 50 && (ack == 0 || syn/ack > 10) {
+		return SecurityCheck{
+			Alert:  true,
+			Name:   "🛡️ TCP-SYN-FLOOD",
+			Reason: fmt.Sprintf("High SYN/ACK ratio (%d/%d) from %s", syn, ack, pkt.SrcIP),
+		}
+	}
+	return SecurityCheck{}
+}
+
+func (t *TCPTracker) Cleanup(ttl time.Duration) {
+	t.muConns.Lock()
+	defer t.muConns.Unlock()
+	now := time.Now()
+	for key, conn := range t.activeConns {
+		if now.Sub(conn.LastSeen) > ttl {
+			delete(t.activeConns, key)
+		}
+	}
+}
+
+================================================================================
+FILE: stateful/tcp_test.go
+================================================================================
+package stateful
+
+import (
+	"dolly-sensor/packet"
+	"testing"
+)
+
+func TestTCPHandshakeTracking(t *testing.T) {
+	tracker := NewTCPTracker()
+	isLocal := func(ip string) bool { return ip == "10.0.0.1" }
+
+	src := "1.2.3.4"
+	dst := "10.0.0.1"
+	sPort := uint16(12345)
+	dPort := uint16(80)
+
+	// 1. Enviar SYN
+	syn := &packet.Event{SrcIP: src, DstIP: dst, SrcPort: sPort, DstPort: dPort, Transport: "TCP", TCPFlags: "SYN", TCPSeq: 100}
+	tracker.Track(syn, isLocal)
+	if syn.HandshakeStep != 1 {
+		t.Errorf("Esperado HandshakeStep 1, obtenido %d", syn.HandshakeStep)
+	}
+
+	// 2. Recibir SYN/ACK (del servidor local al cliente remoto)
+	synAck := &packet.Event{SrcIP: dst, DstIP: src, SrcPort: dPort, DstPort: sPort, Transport: "TCP", TCPFlags: "SYN/ACK", TCPSeq: 500}
+	tracker.Track(synAck, isLocal)
+	if synAck.HandshakeStep != 2 {
+		t.Errorf("Esperado HandshakeStep 2, obtenido %d", synAck.HandshakeStep)
+	}
+
+	// 3. Enviar ACK final para completar handshake
+	ack := &packet.Event{SrcIP: src, DstIP: dst, SrcPort: sPort, DstPort: dPort, Transport: "TCP", TCPFlags: "ACK", TCPSeq: 101, TCPAck: 501}
+	tracker.Track(ack, isLocal)
+	if ack.HandshakeStep != 3 || !ack.HandshakeComplete {
+		t.Errorf("Esperado HandshakeStep 3 y HandshakeComplete true")
+	}
+
+	// Verificar que la conexión está activa
+	if !tracker.HasConnection(src, sPort, dst, dPort) {
+		t.Error("La conexión debería estar en el mapa de conexiones activas")
+	}
+}
+
+
+================================================================================
+FILE: trustscore/engine.go
+================================================================================
+package trustscore
+
+import (
+	"fmt"
+	"strings"
+	"time"
+)
+
+// UpdateTrustScore actualiza el registro de confianza de una IP basándose en su comportamiento
+func UpdateTrustScore(trust *SourceTrust, ev TrustEvent, isManual bool) {
+	if trust.SeenDays == nil { trust.SeenDays = make(map[string]bool) }
+	if trust.Fingerprints == nil { trust.Fingerprints = make(map[string]int) }
+	if trust.Protocols == nil { trust.Protocols = make(map[string]uint64) }
+	if trust.TCPFlags == nil { trust.TCPFlags = make(map[string]uint64) }
+
+	trust.LastSeen = time.Now()
+	if trust.FirstSeen.IsZero() { 
+		trust.FirstSeen = trust.LastSeen
+		trust.AddScoreEvent(2, "Initial detection")
+	}
+	trust.IsManualTrust = isManual || trust.IsManualTrust
+	
+	day := trust.LastSeen.Format("2006-01-02")
+	if !trust.SeenDays[day] {
+		trust.SeenDays[day] = true
+		trust.AddScoreEvent(2, fmt.Sprintf("Activity day %d", len(trust.SeenDays)))
+	}
+
+	trust.Protocols[ev.BestProtocol]++
+	finger := fmt.Sprintf("%s/%d", ev.Protocol, ev.SrcPort)
+	trust.Fingerprints[finger]++
+
+	flags := strings.ToUpper(ev.TCPFlags)
+	if flags != "" {
+		trust.TCPFlags[flags]++
+	}
+
+	// Seguimiento de flags para análisis de flood
+	if strings.Contains(flags, "SYN") && !strings.Contains(flags, "ACK") {
+		trust.SYNCount++
+	}
+
+	// Premiar el comportamiento legítimo (Handshake completo)
+	if ev.HandshakeComplete {
+		trust.HandshakeCompleted = true
+		if time.Since(trust.LastHandshakeAward) > 1*time.Hour {
+			trust.AddScoreEvent(10, "Successful TCP Handshake")
+			trust.LastHandshakeAward = time.Now()
+		}
+	}
+
+	if ev.InEstablishedSession || trust.HandshakeCompleted {
+		if strings.Contains(flags, "ACK") { 
+			trust.ACKCount++ 
+			if trust.ACKCount == 100 { trust.AddScoreEvent(5, "100+ ACK packets verified") }
+		}
+		if strings.Contains(flags, "PSH") { 
+			trust.PSHCount++ 
+			if trust.PSHCount == 100 { trust.AddScoreEvent(5, "100+ PSH packets verified") }
+		}
+	}
+
+	trust.UpdateScore()
+}
+
+// ApplyDecay reduce la confianza de IPs inactivas
+func ApplyDecay(trusts map[string]*SourceTrust) {
+	now := time.Now()
+	for ip, trust := range trusts {
+		if trust.IsManualTrust { continue }
+
+		daysInactive := now.Sub(trust.LastSeen).Hours() / 24
+		if daysInactive >= 1.0 {
+			trust.AddScoreEvent(-10, "Inactivity penalty")
+			
+			if trust.TrustScore == 0 && daysInactive > 30 {
+				delete(trusts, ip)
+			}
+		}
+	}
+}
+
+
+================================================================================
+FILE: trustscore/types.go
+================================================================================
+package trustscore
+
+import (
+	"time"
+)
+
+type ScoreEvent struct {
+	Delta     int       `json:"delta"`
+	Reason    string    `json:"reason"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+type TrustEvent struct {
+	Protocol           string
+	BestProtocol       string
+	SrcPort            uint16
+	TCPFlags           string
+	HandshakeComplete  bool
+	InEstablishedSession bool
+}
+
+type SourceTrust struct {
+	IP             string             `json:"ip"`
+	FirstSeen      time.Time          `json:"first_seen"`
+	LastSeen       time.Time          `json:"last_seen"`
+	SeenDays       map[string]bool    `json:"seen_days"`
+	Fingerprints   map[string]int     `json:"fingerprints"`
+	
+	// Contadores históricos
+	SYNCount       int                `json:"syn_count"`
+	ACKCount       int                `json:"ack_count"`
+	PSHCount       int                `json:"psh_count"`
+	
+	// Estadísticas por protocolo y flags
+	Protocols      map[string]uint64  `json:"protocols"`
+	TCPFlags       map[string]uint64  `json:"tcp_flags_stats"`
+
+	// Estado del Handshake
+	HandshakeCompleted bool           `json:"handshake_completed"`
+	LastHandshakeAward time.Time      `json:"last_handshake_award"`
+	Last15mAward       time.Time      `json:"last_15m_award"`
+	Last30mAward       time.Time      `json:"last_30m_award"`
+
+	// Puntuación de Confianza (0-100)
+	TrustScore     int                `json:"trust_score"`
+	History        []ScoreEvent       `json:"history"`
+	IsManualTrust  bool               `json:"is_manual_trust"`
+}
+
+func (s *SourceTrust) AddScoreEvent(delta int, reason string) {
+	s.History = append(s.History, ScoreEvent{
+		Delta:     delta,
+		Reason:    reason,
+		Timestamp: time.Now(),
+	})
+	if len(s.History) > 50 {
+		s.History = s.History[1:]
+	}
+	s.UpdateScore()
+}
+
+func (s *SourceTrust) UpdateScore() {
+	if s.IsManualTrust {
+		s.TrustScore = 100
+		return
+	}
+	score := 0
+	for _, ev := range s.History {
+		score += ev.Delta
+	}
+	if score < 0 { score = 0 }
+	if score > 100 { score = 100 }
+	s.TrustScore = score
+}
